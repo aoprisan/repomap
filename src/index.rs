@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
 use rusqlite::Connection;
 use walkdir::WalkDir;
 
@@ -44,8 +45,20 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
     let mut indexed = 0usize;
     let mut skipped = 0usize;
 
+    // Determinate bar over the scanned candidates. indicatif draws to stderr
+    // and hides itself when stderr is not a TTY, so piped/scripted runs stay
+    // clean and only the final summary line (stdout) survives.
+    let bar = ProgressBar::new(candidates.len() as u64);
+    bar.set_style(
+        ProgressStyle::with_template("{spinner} [{bar:30}] {pos}/{len} files {wide_msg}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
+
     let tx = conn.transaction()?;
     for c in &candidates {
+        bar.inc(1);
+        bar.set_message(c.rel.clone());
         seen.insert(c.rel.clone());
         let abs = root.join(&c.rel);
         let bytes = match std::fs::read(&abs) {
@@ -93,8 +106,10 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
         }
     }
 
+    bar.set_message("resolving edges…");
     resolve_edges(&tx)?;
     tx.commit()?;
+    bar.finish_and_clear();
 
     let symbols: i64 = conn.query_row("SELECT count(*) FROM symbols", [], |r| r.get(0))?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM edges", [], |r| r.get(0))?;

@@ -36,6 +36,12 @@ fn main() -> Result<()> {
         return query::show_db(&db_path);
     }
 
+    // `--clear-db` removes the index file (incl. SQLite's WAL/SHM sidecars) and
+    // exits, so we never reopen/recreate an empty database afterward.
+    if args.clear_db {
+        return query::clear_db(&db_path);
+    }
+
     let mut conn = db::open(&db_path)?;
 
     let cmd = match args.cmd {

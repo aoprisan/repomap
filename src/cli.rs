@@ -19,6 +19,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub show_db: bool,
 
+    /// Delete the resolved index database and exit.
+    #[arg(long, global = true)]
+    pub clear_db: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }

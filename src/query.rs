@@ -244,6 +244,25 @@ pub fn show_db(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Delete the index database file (and SQLite's `-wal`/`-shm` sidecars) so the
+/// next `index` run starts clean. A no-op if nothing was indexed yet.
+pub fn clear_db(path: &str) -> Result<()> {
+    let file = std::path::Path::new(path);
+    if !file.exists() {
+        println!("{path}  (nothing to clear)");
+        return Ok(());
+    }
+    std::fs::remove_file(file)?;
+    for ext in ["-wal", "-shm"] {
+        let sidecar = format!("{path}{ext}");
+        if std::path::Path::new(&sidecar).exists() {
+            std::fs::remove_file(&sidecar)?;
+        }
+    }
+    println!("{path}  (cleared)");
+    Ok(())
+}
+
 /// Turn free text into a tolerant FTS5 prefix query: each bareword becomes a
 /// prefix term so `find handle` matches `handleRequest`.
 fn fts_query(q: &str) -> String {
@@ -308,5 +327,24 @@ mod tests {
         // Existing (empty schema) database: summarizes without error.
         crate::db::open(path_str).unwrap();
         show_db(path_str).unwrap();
+    }
+
+    #[test]
+    fn clear_db_removes_the_database_and_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let path_str = path.to_str().unwrap();
+
+        // Missing file: no-op, no error.
+        clear_db(path_str).unwrap();
+
+        // Existing database plus WAL/SHM sidecars: all removed.
+        crate::db::open(path_str).unwrap();
+        std::fs::write(format!("{path_str}-wal"), b"").unwrap();
+        std::fs::write(format!("{path_str}-shm"), b"").unwrap();
+        clear_db(path_str).unwrap();
+        assert!(!path.exists());
+        assert!(!std::path::Path::new(&format!("{path_str}-wal")).exists());
+        assert!(!std::path::Path::new(&format!("{path_str}-shm")).exists());
     }
 }
