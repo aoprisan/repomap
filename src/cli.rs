@@ -1,0 +1,47 @@
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "repomap", version, about = "Compact code-navigation index for LLM agents")]
+pub struct Cli {
+    /// Repo root to index/query.
+    #[arg(long, global = true, default_value = ".")]
+    pub root: String,
+
+    /// Index database path (default: <root>/.repomap.db).
+    #[arg(long, global = true)]
+    pub db: Option<String>,
+
+    /// Copy this binary into a `bin` directory on your PATH and exit.
+    #[arg(long, global = true)]
+    pub install: bool,
+
+    #[command(subcommand)]
+    pub cmd: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+pub enum Cmd {
+    /// (Re)index the repo. --incremental skips files whose git hash is unchanged.
+    Index {
+        #[arg(long)]
+        incremental: bool,
+    },
+    /// List services: `name  (stack)  N files  entrypoint`.
+    Map,
+    /// Search symbols; each hit one line: `service/path:Lstart  <sig>  [enclosing]`.
+    Find {
+        query: String,
+        #[arg(long)]
+        service: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        lang: Option<String>,
+        #[arg(short = 'k', default_value_t = 10)]
+        k: usize,
+    },
+    /// Definition site(s) of a symbol, one line each.
+    Def { symbol: String },
+    /// Symbols with an edge pointing at <symbol>, one line each.
+    Callers { symbol: String },
+}

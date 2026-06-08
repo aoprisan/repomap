@@ -1,0 +1,15 @@
+[[service]]
+name = "billing"
+path = "fixtures/billing"
+stack = "scala"
+purpose = "Invoice + tax domain"
+entrypoints = ["src/main/scala/billing/InvoiceService.scala"]
+deps = []
+
+[[service]]
+name = "repomap"
+path = "src"
+stack = "rust"
+purpose = "The indexer itself"
+entrypoints = ["main.rs"]
+deps = []
