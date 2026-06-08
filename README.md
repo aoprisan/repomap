@@ -95,8 +95,11 @@ $ repomap callers get
 billing/src/main/scala/billing/Invoice.scala:L23  val base = get(id).map(_.amountCents).getOrElse(0L)  [total]  (call)
 ```
 
-> **Note:** edges are resolved best-effort by name (same-service preferred), so
-> common names like `get` or `apply` can cross-link to unrelated symbols.
+> **Note:** edges are resolved best-effort by name, **scoped to the source's own
+> service** (same-file definition preferred). A bare reference with no
+> same-service definition is dropped rather than guessed — so `callers` will
+> miss genuine cross-service calls, but won't cross-link `get`/`apply`-style
+> common names to unrelated symbols in other services.
 
 ## Services
 
@@ -124,7 +127,8 @@ A file is assigned to the service whose `path` is the longest matching prefix.
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.
 - **Store** — symbols and FTS live in SQLite (bundled rusqlite, FTS5). Edges are
   stored name-keyed in `edge_raw`, then rebuilt into `edges` on each index run
-  by resolving destination names to symbol ids.
+  by resolving destination names to symbol ids — same-service only, same-file
+  preferred, self-edges excluded (see the note under `callers`).
 - **Incremental** — indexing keys on each file's git blob hash (pure-Rust,
   `git hash-object`-compatible) to skip unchanged files.
 

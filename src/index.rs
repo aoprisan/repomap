@@ -250,18 +250,30 @@ fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
 }
 
 /// Rebuild `edges` from `edge_raw`, resolving each dst name to a single
-/// symbol id (same-service preferred, then lowest id). Best-effort.
+/// symbol id. Best-effort, deliberately conservative:
+///
+/// * Resolution is scoped to the **same service** as the source. Bare names
+///   are ambiguous across a monorepo — a Rust `map.get(..)` and a Scala
+///   `repo.get(..)` both surface a `get` reference, and there is no reliable
+///   way to link those across services by name alone. Rather than guess (and
+///   cross-link `get`/`apply`/`new` to whatever unrelated symbol sorts first),
+///   we drop a reference that has no same-service definition.
+/// * Within a service, a definition in the **same file** wins, then lowest id.
+/// * **Self-edges are excluded** so a symbol is never its own caller (e.g. a
+///   recursive call, or a method whose body references its own name).
 fn resolve_edges(tx: &rusqlite::Transaction) -> Result<()> {
     tx.execute("DELETE FROM edges", [])?;
     tx.execute(
         "INSERT INTO edges(src_symbol, dst_symbol, kind)
          SELECT er.src_symbol, d.id, er.kind
          FROM edge_raw er
+         JOIN symbols src ON src.id = er.src_symbol
          JOIN symbols d ON d.id = (
              SELECT s.id FROM symbols s
              WHERE s.name = er.dst_name
-             ORDER BY (s.service = (SELECT service FROM symbols WHERE id = er.src_symbol)) DESC,
-                      s.id
+               AND s.service = src.service
+               AND s.id <> er.src_symbol
+             ORDER BY (s.file = src.file) DESC, s.id
              LIMIT 1
          )",
         [],
@@ -283,4 +295,159 @@ fn epoch_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+    use rusqlite::Connection;
+    use std::path::PathBuf;
+
+    #[test]
+    fn enclosing_picks_the_innermost_span() {
+        // (id, start, end): an outer fn (1), a nested block (3) inside it.
+        let spans = vec![(1i64, 1usize, 100usize), (2, 10, 40), (3, 12, 15)];
+        assert_eq!(enclosing(&spans, 13), Some(3)); // innermost wins
+        assert_eq!(enclosing(&spans, 25), Some(2));
+        assert_eq!(enclosing(&spans, 5), Some(1));
+        assert_eq!(enclosing(&spans, 200), None); // outside every span
+    }
+
+    /// Materialize `files` (repo-relative path -> contents) under a temp dir.
+    fn build_repo(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (rel, content) in files {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        dir
+    }
+
+    fn open_db(dir: &tempfile::TempDir) -> (Connection, PathBuf) {
+        let db_path = dir.path().join(".repomap.db");
+        let conn = db::open(db_path.to_str().unwrap()).unwrap();
+        (conn, db_path)
+    }
+
+    /// Full-index a fresh repo and hand back the open connection.
+    fn index_repo(files: &[(&str, &str)]) -> (Connection, tempfile::TempDir) {
+        let dir = build_repo(files);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+        (conn, dir)
+    }
+
+    fn edge_exists(conn: &Connection, src_name: &str, dst_name: &str) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM edges e
+             JOIN symbols s ON s.id = e.src_symbol
+             JOIN symbols d ON d.id = e.dst_symbol
+             WHERE s.name = ?1 AND d.name = ?2",
+            rusqlite::params![src_name, dst_name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    /// File of the symbol that the (single) edge out of `src_name` resolves to.
+    fn dst_file_of(conn: &Connection, src_name: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT d.file FROM edges e
+             JOIN symbols s ON s.id = e.src_symbol
+             JOIN symbols d ON d.id = e.dst_symbol
+             WHERE s.name = ?1",
+            [src_name],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    }
+
+    fn symbol_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT count(*) FROM symbols WHERE name = ?1",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            > 0
+    }
+
+    #[test]
+    fn resolves_a_same_service_call() {
+        let (conn, _dir) = index_repo(&[(
+            "svc/a.rs",
+            "pub fn caller() { helper(); }\npub fn helper() {}\n",
+        )]);
+        assert!(edge_exists(&conn, "caller", "helper"));
+    }
+
+    #[test]
+    fn drops_cross_service_references() {
+        // `caller` in svca calls `helper`, which is only defined in svcb.
+        // The old resolver linked across services; the new one drops it.
+        let (conn, _dir) = index_repo(&[
+            ("svca/a.rs", "pub fn caller() { helper(); }\n"),
+            ("svcb/b.rs", "pub fn helper() {}\n"),
+        ]);
+        assert!(symbol_exists(&conn, "helper"), "helper is still indexed");
+        assert!(
+            !edge_exists(&conn, "caller", "helper"),
+            "a bare-name reference must not cross service boundaries"
+        );
+    }
+
+    #[test]
+    fn same_file_definition_wins_within_a_service() {
+        // `target` is defined in both files of the same service; the caller's
+        // own file should win the tie.
+        let (conn, _dir) = index_repo(&[
+            ("svc/a.rs", "pub fn caller() { target(); }\npub fn target() {}\n"),
+            ("svc/b.rs", "pub fn target() {}\n"),
+        ]);
+        assert_eq!(dst_file_of(&conn, "caller").as_deref(), Some("svc/a.rs"));
+    }
+
+    #[test]
+    fn recursive_call_is_not_a_self_edge() {
+        let (conn, _dir) = index_repo(&[("svc/a.rs", "pub fn fib() { fib(); }\n")]);
+        assert!(
+            !edge_exists(&conn, "fib", "fib"),
+            "a symbol must not be its own caller"
+        );
+    }
+
+    #[test]
+    fn incremental_skips_unchanged_then_picks_up_edits() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn f() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+
+        let s1 = run(&mut conn, dir.path(), false, &db_path).unwrap();
+        assert_eq!(s1.files_indexed, 1);
+
+        let s2 = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s2.files_indexed, 0);
+        assert_eq!(s2.files_skipped, 1);
+
+        std::fs::write(dir.path().join("svc/a.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+        let s3 = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s3.files_indexed, 1);
+        assert_eq!(s3.files_skipped, 0);
+        assert!(symbol_exists(&conn, "g"));
+    }
+
+    #[test]
+    fn incremental_purges_deleted_files() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn f() {}\n"), ("svc/b.rs", "pub fn g() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+        assert!(symbol_exists(&conn, "g"));
+
+        std::fs::remove_file(dir.path().join("svc/b.rs")).unwrap();
+        let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s.files_removed, 1);
+        assert!(!symbol_exists(&conn, "g"), "deleted file's symbols are gone");
+    }
 }

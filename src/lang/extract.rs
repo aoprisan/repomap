@@ -166,3 +166,26 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{cut}…")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn last_segment_takes_the_trailing_identifier() {
+        assert_eq!(last_segment("a::b::c"), "c");
+        assert_eq!(last_segment("a.b.c"), "c");
+        assert_eq!(last_segment("a.b.c;"), "c"); // trailing punctuation stripped
+        assert_eq!(last_segment("use std::collections::HashMap;"), "HashMap");
+        assert_eq!(last_segment("plain"), "plain");
+    }
+
+    #[test]
+    fn truncate_is_char_aware_and_appends_ellipsis() {
+        assert_eq!(truncate("abc", 10), "abc"); // under the limit, unchanged
+        assert_eq!(truncate("abc", 3), "abc"); // exactly at the limit
+        assert_eq!(truncate("abcdef", 3), "abc…");
+        // Counts characters, not bytes: a 3-char multibyte string is untouched.
+        assert_eq!(truncate("é€λ", 3), "é€λ");
+    }
+}
