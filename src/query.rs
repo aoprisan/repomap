@@ -210,6 +210,40 @@ pub fn map(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Report the index database in use: its path, and — if it exists — size and
+/// row counts. A diagnostic for "which db am I actually hitting?". Opens the
+/// file read-only and never creates it, so it stays a pure inspection.
+pub fn show_db(path: &str) -> Result<()> {
+    let file = std::path::Path::new(path);
+    if !file.exists() {
+        println!("{path}  (not indexed yet — run `repomap index`)");
+        return Ok(());
+    }
+
+    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    let conn = Connection::open(path)?;
+    let count = |table: &str| -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let indexed_at: Option<i64> = conn
+        .query_row("SELECT max(indexed_at) FROM files", [], |r| r.get(0))
+        .ok()
+        .flatten();
+
+    println!("{path}");
+    println!("  size      {} KiB", size / 1024);
+    println!("  services  {}", count("services"));
+    println!("  files     {}", count("files"));
+    println!("  symbols   {}", count("symbols"));
+    println!("  edges     {}", count("edges"));
+    match indexed_at {
+        Some(ts) => println!("  indexed   {ts} (epoch seconds)"),
+        None => println!("  indexed   never"),
+    }
+    Ok(())
+}
+
 /// Turn free text into a tolerant FTS5 prefix query: each bareword becomes a
 /// prefix term so `find handle` matches `handleRequest`.
 fn fts_query(q: &str) -> String {
@@ -239,5 +273,40 @@ fn first_json_item(s: &str) -> Option<String> {
         None
     } else {
         Some(unquoted.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fts_query_makes_each_word_a_prefix_term() {
+        assert_eq!(fts_query("handle req"), "handle* req*");
+        // Punctuation is stripped from terms; empty input never yields bad syntax.
+        assert_eq!(fts_query("get()"), "get*");
+        assert_eq!(fts_query("   "), "\"\"");
+    }
+
+    #[test]
+    fn first_json_item_reads_the_leading_element() {
+        assert_eq!(first_json_item(r#"["Main.scala","b"]"#).as_deref(), Some("Main.scala"));
+        assert_eq!(first_json_item("[]"), None);
+        assert_eq!(first_json_item("not json"), None);
+    }
+
+    #[test]
+    fn show_db_handles_missing_and_existing_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let path_str = path.to_str().unwrap();
+
+        // Missing file: reports, does not create the database.
+        show_db(path_str).unwrap();
+        assert!(!path.exists(), "show_db must not create the database");
+
+        // Existing (empty schema) database: summarizes without error.
+        crate::db::open(path_str).unwrap();
+        show_db(path_str).unwrap();
     }
 }

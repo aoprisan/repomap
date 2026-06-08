@@ -41,6 +41,25 @@ Global flags (valid on any subcommand):
 |------|---------|---------|
 | `--root <dir>` | `.` | Repo root to index/query |
 | `--db <path>` | `<root>/.repomap.db` | Index database location |
+| `--show-db` | | Print the resolved database path and stats, then exit |
+
+`--show-db` answers "which database am I actually using?" — it prints the
+resolved path and, if the file exists, its size and row counts. It opens the
+file read-only and never creates one:
+
+```
+$ repomap --show-db
+./.repomap.db
+  size      144 KiB
+  services  2
+  files     14
+  symbols   120
+  edges     109
+  indexed   1780942229 (epoch seconds)
+
+$ repomap --db /tmp/other.db --show-db
+/tmp/other.db  (not indexed yet — run `repomap index`)
+```
 
 ## Commands
 

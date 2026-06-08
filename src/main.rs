@@ -30,6 +30,12 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| root.join(".repomap.db").to_string_lossy().to_string());
     let db_file = PathBuf::from(&db_path);
 
+    // `--show-db` is a read-only diagnostic: report the path we resolved (and
+    // its contents if it exists) without creating an empty database first.
+    if args.show_db {
+        return query::show_db(&db_path);
+    }
+
     let mut conn = db::open(&db_path)?;
 
     let cmd = match args.cmd {
