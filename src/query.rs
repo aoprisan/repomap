@@ -273,7 +273,10 @@ fn fts_query(q: &str) -> String {
             clean
         })
         .filter(|t| !t.is_empty())
-        .map(|t| format!("{t}*"))
+        // Quote each term so FTS5 boolean keywords (OR/AND/NOT/NEAR) are treated
+        // as literal search words, not operators. Cleaned terms hold only
+        // alphanumerics/underscore, so there are no embedded quotes to escape.
+        .map(|t| format!("\"{t}\"*"))
         .collect();
     if terms.is_empty() {
         // Fall back to a never-matching token rather than invalid syntax.
@@ -301,10 +304,12 @@ mod tests {
 
     #[test]
     fn fts_query_makes_each_word_a_prefix_term() {
-        assert_eq!(fts_query("handle req"), "handle* req*");
+        assert_eq!(fts_query("handle req"), "\"handle\"* \"req\"*");
         // Punctuation is stripped from terms; empty input never yields bad syntax.
-        assert_eq!(fts_query("get()"), "get*");
+        assert_eq!(fts_query("get()"), "\"get\"*");
         assert_eq!(fts_query("   "), "\"\"");
+        // FTS5 boolean keywords are quoted to literals, not operators.
+        assert_eq!(fts_query("a OR b"), "\"a\"* \"OR\"* \"b\"*");
     }
 
     #[test]
