@@ -42,6 +42,7 @@ Global flags (valid on any subcommand):
 | `--root <dir>` | `.` | Repo root to index/query |
 | `--db <path>` | `<root>/.repomap.db` | Index database location |
 | `--show-db` | | Print the resolved database path and stats, then exit |
+| `--clear-db` | | Delete the resolved database (and its WAL/SHM sidecars), then exit |
 
 `--show-db` answers "which database am I actually using?" — it prints the
 resolved path and, if the file exists, its size and row counts. It opens the
@@ -59,6 +60,18 @@ $ repomap --show-db
 
 $ repomap --db /tmp/other.db --show-db
 /tmp/other.db  (not indexed yet — run `repomap index`)
+```
+
+`--clear-db` removes the resolved database file along with SQLite's `-wal` and
+`-shm` sidecars, then exits without recreating an empty one. It's a no-op if the
+file doesn't exist:
+
+```
+$ repomap --clear-db
+./.repomap.db  (cleared)
+
+$ repomap --clear-db
+./.repomap.db  (nothing to clear)
 ```
 
 ## Commands
