@@ -121,12 +121,17 @@ fn signature_of(node: Node, bytes: &[u8]) -> String {
     truncate(&one, 200)
 }
 
-/// Nearest preceding comment sibling's first line, markers stripped.
+/// Nearest preceding comment sibling's first line, markers stripped. When the
+/// def has no preceding sibling (e.g. a TS `export`-wrapped declaration), look
+/// at the wrapping parent's preceding sibling instead.
 fn doc_of(node: Node, bytes: &[u8]) -> Option<String> {
-    let prev = node.prev_sibling()?;
-    if !prev.kind().contains("comment") {
-        return None;
-    }
+    // The def's own preceding sibling, or — for `export`-wrapped declarations
+    // where that sibling is the `export` keyword — the wrapper's. Take whichever
+    // is actually a comment.
+    let prev = [node.prev_sibling(), node.parent().and_then(|p| p.prev_sibling())]
+        .into_iter()
+        .flatten()
+        .find(|n| n.kind().contains("comment"))?;
     let raw = text(prev, bytes);
     let line = raw.lines().next().unwrap_or("");
     let cleaned = line
@@ -134,7 +139,9 @@ fn doc_of(node: Node, bytes: &[u8]) -> Option<String> {
         .trim_start_matches("/**")
         .trim_start_matches("/*")
         .trim_start_matches("//")
+        .trim_start_matches('#') // Ruby/shell line comments
         .trim_start_matches('*')
+        .trim_end_matches("*/") // close of a `/** ... */` block comment
         .trim();
     if cleaned.is_empty() {
         None

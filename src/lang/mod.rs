@@ -2,8 +2,11 @@
 //! New language = new `lang/<x>.rs` + `queries/<x>.scm` + one arm below.
 
 mod extract;
+mod python;
+mod ruby;
 mod rust;
 mod scala;
+mod typescript;
 
 pub use extract::Extracted;
 
@@ -13,7 +16,10 @@ use std::path::Path;
 pub enum Language {
     Scala,
     Rust,
-    // Typescript, Elm — later: add an arm to each match below.
+    Ruby,
+    Python,
+    Typescript,
+    // Elm — later: add an arm to each match below.
 }
 
 impl Language {
@@ -22,6 +28,9 @@ impl Language {
         match path.extension()?.to_str()? {
             "scala" | "sc" => Some(Language::Scala),
             "rs" => Some(Language::Rust),
+            "rb" => Some(Language::Ruby),
+            "py" => Some(Language::Python),
+            "ts" | "tsx" => Some(Language::Typescript),
             _ => None,
         }
     }
@@ -30,6 +39,9 @@ impl Language {
         match self {
             Language::Scala => "scala",
             Language::Rust => "rust",
+            Language::Ruby => "ruby",
+            Language::Python => "python",
+            Language::Typescript => "typescript",
         }
     }
 
@@ -37,6 +49,9 @@ impl Language {
         match self {
             Language::Scala => scala::language(),
             Language::Rust => rust::language(),
+            Language::Ruby => ruby::language(),
+            Language::Python => python::language(),
+            Language::Typescript => typescript::language(),
         }
     }
 
@@ -44,6 +59,9 @@ impl Language {
         match self {
             Language::Scala => scala::QUERY,
             Language::Rust => rust::QUERY,
+            Language::Ruby => ruby::QUERY,
+            Language::Python => python::QUERY,
+            Language::Typescript => typescript::QUERY,
         }
     }
 
@@ -77,7 +95,11 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a.rs")), Some(Language::Rust));
         assert_eq!(Language::from_path(Path::new("a.scala")), Some(Language::Scala));
         assert_eq!(Language::from_path(Path::new("a.sc")), Some(Language::Scala));
-        assert_eq!(Language::from_path(Path::new("a.py")), None);
+        assert_eq!(Language::from_path(Path::new("a.rb")), Some(Language::Ruby));
+        assert_eq!(Language::from_path(Path::new("a.py")), Some(Language::Python));
+        assert_eq!(Language::from_path(Path::new("a.ts")), Some(Language::Typescript));
+        assert_eq!(Language::from_path(Path::new("a.tsx")), Some(Language::Typescript));
+        assert_eq!(Language::from_path(Path::new("a.txt")), None);
         assert_eq!(Language::from_path(Path::new("noext")), None);
     }
 
@@ -121,5 +143,96 @@ object Foo extends Bar {
         assert_eq!(symbol(&e, "baz").kind, "def");
         assert!(has_edge(&e, "call", "qux"), "call edge to qux");
         assert!(has_edge(&e, "extends", "Bar"), "extends edge to Bar");
+    }
+
+    #[test]
+    fn ruby_extraction_captures_classes_methods_and_edges() {
+        let src = "\
+# A widget.
+class Widget < Base
+  def render(x)
+    draw(x)
+  end
+end
+
+module Helpers
+  def self.format(s)
+    s
+  end
+end
+";
+        let e = Language::Ruby.extract(src).unwrap();
+
+        let widget = symbol(&e, "Widget");
+        assert_eq!(widget.kind, "class");
+        assert_eq!(widget.signature, "class Widget < Base");
+        assert_eq!(widget.doc_first_line.as_deref(), Some("A widget."));
+
+        assert_eq!(symbol(&e, "render").kind, "method");
+        assert_eq!(symbol(&e, "Helpers").kind, "module");
+        assert_eq!(symbol(&e, "format").kind, "method"); // singleton_method
+
+        assert!(has_edge(&e, "call", "draw"), "call edge to draw");
+        assert!(has_edge(&e, "extends", "Base"), "superclass edge to Base");
+    }
+
+    #[test]
+    fn python_extraction_captures_classes_functions_and_edges() {
+        let src = "\
+import os.path
+from collections import OrderedDict
+
+# A widget.
+class Widget(Base):
+    def render(self, x):
+        return draw(x)
+";
+        let e = Language::Python.extract(src).unwrap();
+
+        let widget = symbol(&e, "Widget");
+        assert_eq!(widget.kind, "class");
+        assert_eq!(widget.signature, "class Widget(Base):");
+        assert_eq!(widget.doc_first_line.as_deref(), Some("A widget."));
+
+        assert_eq!(symbol(&e, "render").kind, "def");
+
+        assert!(has_edge(&e, "call", "draw"), "call edge to draw");
+        assert!(has_edge(&e, "extends", "Base"), "base-class edge to Base");
+        assert!(has_edge(&e, "import", "path"), "import os.path last segment");
+        assert!(has_edge(&e, "import", "OrderedDict"), "from-import last segment");
+    }
+
+    #[test]
+    fn typescript_extraction_captures_classes_funcs_and_edges() {
+        let src = "\
+import { Base } from './base';
+
+/** A widget. */
+export class Widget extends Base implements Drawable {
+  render(x: number): number {
+    return draw(x);
+  }
+}
+
+interface Drawable {}
+
+export function helper(n: number): number { return n; }
+const arrow = (y: number) => helper(y);
+";
+        let e = Language::Typescript.extract(src).unwrap();
+
+        let widget = symbol(&e, "Widget");
+        assert_eq!(widget.kind, "class");
+        assert_eq!(widget.doc_first_line.as_deref(), Some("A widget."));
+
+        assert_eq!(symbol(&e, "render").kind, "method");
+        assert_eq!(symbol(&e, "Drawable").kind, "interface");
+        assert_eq!(symbol(&e, "helper").kind, "function");
+        assert_eq!(symbol(&e, "arrow").kind, "function"); // const arrow fn
+
+        assert!(has_edge(&e, "call", "draw"), "call edge to draw");
+        assert!(has_edge(&e, "extends", "Base"), "extends edge to Base");
+        assert!(has_edge(&e, "extends", "Drawable"), "implements edge to Drawable");
+        assert!(has_edge(&e, "import", "Base"), "named import Base");
     }
 }

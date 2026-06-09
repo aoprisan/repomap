@@ -13,7 +13,19 @@ use crate::git;
 use crate::lang::Language;
 use crate::services::{self, Resolver, Service};
 
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".repomap"];
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".repomap",
+    // Python virtualenvs & caches — vendored deps, not project code.
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+];
 
 struct Candidate {
     rel: String,
