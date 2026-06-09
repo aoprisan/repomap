@@ -26,6 +26,22 @@ falling back to `~/.local/bin`. It warns if the chosen directory isn't on
 `PATH`. Because it copies, the installed tool keeps working after `cargo clean`
 or moving the source tree.
 
+### Install the Claude Code skill
+
+`repomap` ships with a [Claude Code](https://claude.com/claude-code) skill that
+teaches an agent how and when to drive the CLI for code navigation. The skill is
+embedded in the binary; drop it into a repo with:
+
+```sh
+repomap --install-skill          # writes ./.claude/skills/repomap/SKILL.md
+repomap --root path/to/repo --install-skill
+```
+
+It writes `<root>/.claude/skills/repomap/SKILL.md`, creating the directories as
+needed and overwriting any prior copy. Once installed, Claude Code will reach for
+`repomap` to locate definitions, find callers, and map services instead of broad
+file reads.
+
 ## Quick start
 
 ```sh

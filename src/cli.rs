@@ -15,6 +15,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub install: bool,
 
+    /// Install the bundled Claude Code skill into `<root>/.claude` and exit.
+    #[arg(long, global = true)]
+    pub install_skill: bool,
+
     /// Print the resolved index database path (with stats) and exit.
     #[arg(long, global = true)]
     pub show_db: bool,

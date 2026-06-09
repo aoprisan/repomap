@@ -6,6 +6,7 @@ mod install;
 mod lang;
 mod query;
 mod services;
+mod skill;
 
 use std::path::PathBuf;
 
@@ -24,6 +25,12 @@ fn main() -> Result<()> {
     }
 
     let root = PathBuf::from(&args.root);
+
+    // `--install-skill` writes the bundled Claude Code skill into the repo's
+    // `.claude` tree and exits, before touching the database.
+    if args.install_skill {
+        return skill::install_skill(&root);
+    }
     let db_path = args
         .db
         .clone()
