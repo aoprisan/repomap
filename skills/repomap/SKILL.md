@@ -47,7 +47,9 @@ an unfamiliar repo.
 ### `repomap find <query> [--service S] [--kind K] [--lang L] [-k N]`
 Full-text symbol search. Each bareword is matched as a prefix, so `find handle`
 matches `handleRequest`. `-k` caps results (default 10). Filter with
-`--service`, `--kind` (e.g. `function`, `class`, `struct`), `--lang`.
+`--service`, `--kind`, `--lang`. `--kind` takes the language-native kind
+(`fn`, `def`, `struct`, `class`, `object`, …) or the generic alias `function`
+(matches `fn`/`def`/`method`) or `module` (matches `mod`).
 
 ```sh
 repomap find Invoice              # symbols matching "Invoice"

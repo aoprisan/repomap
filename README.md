@@ -9,7 +9,8 @@ It deliberately stores **pointers, never code bodies**. The output is sized for
 dropping into an agent's context: one symbol per line, enough to locate and
 disambiguate, nothing more.
 
-Languages supported today: **Rust** and **Scala**.
+Languages supported today: **Rust**, **Scala**, **Ruby**, **Python**, and
+**TypeScript**.
 
 ## Install
 
@@ -116,6 +117,9 @@ repomap  (rust)  12 files  main.rs
 
 Full-text symbol search. Each hit is one line:
 `service/path:Lstart  <signature>  [enclosing]`. `-k` caps results (default 10).
+`--kind` accepts the language-native kind (`fn`, `def`, `struct`, `object`, …)
+or a generic alias: `function` matches `fn`/`def`/`method`, `module` matches
+`mod`.
 
 ```
 $ repomap find Invoice -k 3

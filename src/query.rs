@@ -72,6 +72,21 @@ fn row_to_pointer(
     }
 }
 
+/// Expand a generic `--kind` into the language-native kinds stored in the
+/// index (Rust stores `fn`, Python/Scala `def`, TypeScript `function`, …).
+/// Native kinds pass through unchanged via the identity entry.
+fn kind_synonyms(kind: &str) -> Vec<&str> {
+    let mut kinds = vec![kind];
+    match kind {
+        "function" => kinds.extend(["fn", "def", "method"]),
+        "fn" | "def" | "method" => kinds.push("function"),
+        "module" => kinds.push("mod"),
+        "mod" => kinds.push("module"),
+        _ => {}
+    }
+    kinds
+}
+
 pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
     let mut sql = format!(
         "SELECT s.service, COALESCE(sv.path, s.service), s.file, s.start_line, s.signature,
@@ -87,8 +102,12 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
         sql.push_str(&format!(" AND s.service = ?{}", params.len()));
     }
     if let Some(v) = &opts.kind {
-        params.push(Box::new(v.clone()));
-        sql.push_str(&format!(" AND s.kind = ?{}", params.len()));
+        let mut placeholders = Vec::new();
+        for k in kind_synonyms(v) {
+            params.push(Box::new(k.to_string()));
+            placeholders.push(format!("?{}", params.len()));
+        }
+        sql.push_str(&format!(" AND s.kind IN ({})", placeholders.join(", ")));
     }
     if let Some(v) = &opts.lang {
         params.push(Box::new(v.clone()));
@@ -310,6 +329,14 @@ mod tests {
         assert_eq!(fts_query("   "), "\"\"");
         // FTS5 boolean keywords are quoted to literals, not operators.
         assert_eq!(fts_query("a OR b"), "\"a\"* \"OR\"* \"b\"*");
+    }
+
+    #[test]
+    fn kind_synonyms_expands_generic_kinds_and_passes_native_through() {
+        assert_eq!(kind_synonyms("function"), vec!["function", "fn", "def", "method"]);
+        assert_eq!(kind_synonyms("fn"), vec!["fn", "function"]);
+        assert_eq!(kind_synonyms("module"), vec!["module", "mod"]);
+        assert_eq!(kind_synonyms("struct"), vec!["struct"]);
     }
 
     #[test]
