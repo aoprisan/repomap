@@ -39,11 +39,35 @@ pub struct Summary {
     pub symbols: usize,
     pub edges: usize,
     pub services: usize,
+    /// The mode the run actually executed in (an incremental request is
+    /// upgraded to full when service definitions changed).
+    pub mode: &'static str,
 }
 
 pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path) -> Result<Summary> {
     let candidates = scan(root, db_file);
     let resolver = build_services(root, &candidates)?;
+
+    // Incremental runs skip unchanged files — but a file's stored service
+    // comes from index time, so a changed repomap.toml (or changed inferred
+    // layout) would leave stale attribution on every skipped file and
+    // mis-scope edge resolution. Detect that via a fingerprint of the
+    // resolved services and upgrade to a full reindex.
+    let fingerprint = services_fingerprint(&resolver);
+    let mut incremental = incremental;
+    let mut mode = if incremental { "incremental" } else { "full" };
+    if incremental {
+        let stored: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'services_fingerprint'", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        if stored.as_deref() != Some(fingerprint.as_str()) {
+            incremental = false;
+            mode = "full: service definitions changed";
+        }
+    }
+
     write_services(conn, &resolver)?;
 
     if !incremental {
@@ -120,19 +144,49 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
 
     bar.set_message("resolving edges…");
     resolve_edges(&tx)?;
+
+    // The synthetic catch-all only earns a row if a file actually landed in
+    // it; otherwise drop it so `map` shows only real services.
+    if let Some(name) = resolver.synthetic_root() {
+        tx.execute(
+            "DELETE FROM services
+             WHERE name = ?1
+               AND NOT EXISTS (SELECT 1 FROM files WHERE service = ?1)",
+            [name],
+        )?;
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('services_fingerprint', ?1)",
+        [&fingerprint],
+    )?;
     tx.commit()?;
     bar.finish_and_clear();
 
     let symbols: i64 = conn.query_row("SELECT count(*) FROM symbols", [], |r| r.get(0))?;
     let edges: i64 = conn.query_row("SELECT count(*) FROM edges", [], |r| r.get(0))?;
+    let services: i64 = conn.query_row("SELECT count(*) FROM services", [], |r| r.get(0))?;
     Ok(Summary {
         files_indexed: indexed,
         files_skipped: skipped,
         files_removed: removed,
         symbols: symbols as usize,
         edges: edges as usize,
-        services: resolver.all().len(),
+        services: services as usize,
+        mode,
     })
+}
+
+/// Stable digest of the resolved service definitions; a mismatch with the
+/// stored value means file→service attribution may be stale.
+fn services_fingerprint(resolver: &Resolver) -> String {
+    let mut buf = String::new();
+    for s in resolver.all() {
+        buf.push_str(&format!(
+            "{}\x1f{}\x1f{:?}\x1f{:?}\x1f{:?}\x1f{:?}\n",
+            s.name, s.path, s.stack, s.purpose, s.entrypoints, s.deps
+        ));
+    }
+    git::blob_hash(buf.as_bytes())
 }
 
 /// Walk the repo collecting indexable files (repo-relative paths).
@@ -463,6 +517,84 @@ mod tests {
         assert_eq!(s3.files_indexed, 1);
         assert_eq!(s3.files_skipped, 0);
         assert!(symbol_exists(&conn, "g"));
+    }
+
+    fn service_of(conn: &Connection, symbol: &str) -> String {
+        conn.query_row(
+            "SELECT service FROM symbols WHERE name = ?1",
+            [symbol],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn service_names(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT name FROM services ORDER BY name").unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    #[test]
+    fn empty_manifest_indexes_into_a_synthetic_root() {
+        // A repomap.toml with no [[service]] used to panic in Resolver::resolve.
+        let (conn, _dir) = index_repo(&[
+            ("repomap.toml", "# no services declared\n"),
+            ("a.rs", "pub fn f() {}\n"),
+        ]);
+        assert_eq!(service_of(&conn, "f"), "root");
+        assert_eq!(service_names(&conn), vec!["root"]);
+    }
+
+    #[test]
+    fn manifest_gap_files_land_in_root_not_a_sibling_service() {
+        let (conn, _dir) = index_repo(&[
+            ("repomap.toml", "[[service]]\nname = \"svc\"\npath = \"svc\"\n"),
+            ("svc/a.rs", "pub fn covered() {}\n"),
+            ("toplevel.rs", "pub fn orphan() {}\n"),
+        ]);
+        assert_eq!(service_of(&conn, "covered"), "svc");
+        assert_eq!(service_of(&conn, "orphan"), "root");
+        assert_eq!(service_names(&conn), vec!["root", "svc"]);
+    }
+
+    #[test]
+    fn unused_synthetic_root_is_dropped_from_services() {
+        let (conn, _dir) = index_repo(&[
+            ("repomap.toml", "[[service]]\nname = \"svc\"\npath = \"svc\"\n"),
+            ("svc/a.rs", "pub fn covered() {}\n"),
+        ]);
+        assert_eq!(service_names(&conn), vec!["svc"]);
+    }
+
+    #[test]
+    fn incremental_goes_full_when_service_definitions_change() {
+        // Two inferred services; `f` calls `g` across them, so no edge yet.
+        let dir = build_repo(&[
+            ("app/a.rs", "pub fn f() { g(); }\n"),
+            ("lib/b.rs", "pub fn g() {}\n"),
+        ]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+        assert_eq!(service_of(&conn, "f"), "app");
+        assert!(!edge_exists(&conn, "f", "g"));
+
+        // Merge everything into one manifest service. An incremental run must
+        // notice, reindex fully, reattribute, and re-scope edge resolution.
+        std::fs::write(
+            dir.path().join("repomap.toml"),
+            "[[service]]\nname = \"everything\"\npath = \".\"\n",
+        )
+        .unwrap();
+        let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s.mode, "full: service definitions changed");
+        assert_eq!(s.files_skipped, 0, "no file may be skipped with stale services");
+        assert_eq!(service_of(&conn, "f"), "everything");
+        assert!(edge_exists(&conn, "f", "g"), "same-service call now resolves");
+
+        // With the manifest unchanged, incremental stays incremental.
+        let s2 = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s2.mode, "incremental");
+        assert!(s2.files_skipped > 0);
     }
 
     #[test]

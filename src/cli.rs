@@ -40,7 +40,7 @@ pub enum Cmd {
     },
     /// List services: `name  (stack)  N files  entrypoint`.
     Map,
-    /// Search symbols; each hit one line: `service/path:Lstart  <sig>  [enclosing]`.
+    /// Search symbols; each hit one line: `path:Lstart  <sig>  [enclosing]`.
     Find {
         query: String,
         #[arg(long)]

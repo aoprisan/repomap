@@ -7,8 +7,9 @@ description: Navigate a polyglot codebase fast using the `repomap` CLI — a com
 
 `repomap` is a CLI that indexes the repository into a SQLite/FTS5 database and
 answers code-navigation queries as **compact pointers** — one line each, of the
-form `service/path:Lstart  <signature>  [enclosing]`. It returns locations and
-signatures, never code bodies, so it is cheap to drop into context.
+form `path:Lstart  <signature>  [enclosing]`, where `path` is the repo-relative
+file path, openable exactly as printed. It returns locations and signatures,
+never code bodies, so it is cheap to drop into context.
 
 Reach for it **before** broad `grep`/`find`/file reading: one `repomap` query
 usually replaces many file reads when you need to locate a symbol, see its
@@ -24,6 +25,9 @@ nothing, build it first:
 repomap index                 # full (re)index of the repo
 repomap index --incremental   # skip files whose git blob hash is unchanged
 ```
+
+(`--incremental` automatically upgrades to a full reindex if the service
+definitions in `repomap.toml` changed since the last run.)
 
 Check whether an index exists and is fresh:
 
@@ -85,7 +89,7 @@ repomap callers get
 2. `repomap find <name>` — locate candidate symbols by fuzzy name.
 3. `repomap def <name>` — pin the exact definition site(s).
 4. `repomap callers <name>` — see who depends on it before changing it.
-5. Open the reported `service/path:Lstart` to read the real code.
+5. Open the reported `path:Lstart` to read the real code.
 
 ## Notes
 
