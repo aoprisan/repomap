@@ -27,21 +27,37 @@ falling back to `~/.local/bin`. It warns if the chosen directory isn't on
 `PATH`. Because it copies, the installed tool keeps working after `cargo clean`
 or moving the source tree.
 
-### Install the Claude Code skill
+### Install the agent skill
 
-`repomap` ships with a [Claude Code](https://claude.com/claude-code) skill that
-teaches an agent how and when to drive the CLI for code navigation. The skill is
-embedded in the binary; drop it into a repo with:
+`repomap` ships with a guide that teaches a coding agent how and when to drive
+the CLI for code navigation. The guide is embedded in the binary; drop it into a
+repo for [Claude Code](https://claude.com/claude-code), [GitHub
+Copilot](https://docs.github.com/en/copilot/customizing-copilot/adding-repository-custom-instructions-for-github-copilot),
+or [OpenAI Codex](https://github.com/openai/codex) with:
 
 ```sh
-repomap --install-skill          # writes ./.claude/skills/repomap/SKILL.md
-repomap --root path/to/repo --install-skill
+repomap --install-skill                  # claude (default) -> ./.claude/skills/repomap/SKILL.md
+repomap --install-skill copilot          # -> ./.github/copilot-instructions.md
+repomap --install-skill codex            # -> ./AGENTS.md
+repomap --root path/to/repo --install-skill copilot
 ```
 
-It writes `<root>/.claude/skills/repomap/SKILL.md`, creating the directories as
-needed and overwriting any prior copy. Once installed, Claude Code will reach for
-`repomap` to locate definitions, find callers, and map services instead of broad
-file reads.
+The target defaults to `claude` when no agent is given, so existing usage is
+unchanged. Each agent gets the guide in its conventional location:
+
+| Agent | File | Behavior |
+|-------|------|----------|
+| `claude` | `<root>/.claude/skills/repomap/SKILL.md` | repomap-owned; written whole (with skill frontmatter), overwriting any prior copy |
+| `copilot` | `<root>/.github/copilot-instructions.md` | shared file; spliced into a marked block, preserving your other content |
+| `codex` | `<root>/AGENTS.md` | shared file; spliced into a marked block, preserving your other content |
+
+Because Copilot and Codex read a *shared* instructions file that may already
+hold your own content, `repomap` writes its section between
+`<!-- BEGIN repomap … -->` / `<!-- END repomap -->` markers: a re-install
+replaces just that block and leaves everything else untouched (the frontmatter
+is dropped there, since those agents read the file as plain instructions). Once
+installed, the agent will reach for `repomap` to locate definitions, find
+callers, and map services instead of broad file reads.
 
 ## Quick start
 

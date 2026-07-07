@@ -26,10 +26,10 @@ fn main() -> Result<()> {
 
     let root = PathBuf::from(&args.root);
 
-    // `--install-skill` writes the bundled Claude Code skill into the repo's
-    // `.claude` tree and exits, before touching the database.
-    if args.install_skill {
-        return skill::install_skill(&root);
+    // `--install-skill [AGENT]` writes the bundled repomap guide into the
+    // target agent's conventional location and exits, before touching the db.
+    if let Some(agent) = args.install_skill {
+        return skill::install_skill(&root, agent);
     }
     let db_path = args
         .db
