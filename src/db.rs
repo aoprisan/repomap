@@ -12,6 +12,13 @@ pub fn open(path: &str) -> Result<Connection> {
 }
 
 const SCHEMA: &str = r#"
+-- Indexer bookkeeping (e.g. the service-definition fingerprint that gates
+-- incremental runs).
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS files (
   path       TEXT PRIMARY KEY,
   service    TEXT NOT NULL,

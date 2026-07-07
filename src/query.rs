@@ -11,39 +11,29 @@ pub struct FindOpts {
     pub k: usize,
 }
 
-/// One result line. `service`/`within` reconstruct the openable repo path.
+/// One result line. `file` is the repo-relative path as indexed, so the
+/// pointer is directly openable from the repo root.
 struct Pointer {
-    service: String,
-    within: String,
+    file: String,
     start_line: i64,
     signature: String,
     enclosing: Option<String>,
 }
 
 impl Pointer {
-    fn print(&self, suffix: &str) {
+    fn line(&self, suffix: &str) -> String {
         let enc = self.enclosing.as_deref().unwrap_or("-");
         let sig = if self.signature.is_empty() {
             "-"
         } else {
             &self.signature
         };
-        println!(
-            "{}/{}:L{}  {}  [{}]{}",
-            self.service, self.within, self.start_line, sig, enc, suffix
-        );
+        format!("{}:L{}  {}  [{}]{}", self.file, self.start_line, sig, enc, suffix)
     }
-}
 
-/// Strip a service's root-path prefix to get the path within the service,
-/// so `service/within` reconstructs the real repo-relative file path.
-fn within(service_path: &str, file: &str) -> String {
-    if service_path == "." || service_path.is_empty() {
-        return file.to_string();
+    fn print(&self, suffix: &str) {
+        println!("{}", self.line(suffix));
     }
-    file.strip_prefix(&format!("{service_path}/"))
-        .unwrap_or(file)
-        .to_string()
 }
 
 // SQL fragment computing the innermost enclosing symbol name for `s`.
@@ -56,16 +46,13 @@ const ENCLOSING_SQL: &str = "(SELECT p.name FROM symbols p
 const INDEG_SQL: &str = "(SELECT count(*) FROM edges WHERE dst_symbol = s.id)";
 
 fn row_to_pointer(
-    service: String,
-    service_path: String,
     file: String,
     start_line: i64,
     signature: Option<String>,
     enclosing: Option<String>,
 ) -> Pointer {
     Pointer {
-        within: within(&service_path, &file),
-        service,
+        file,
         start_line,
         signature: signature.unwrap_or_default(),
         enclosing,
@@ -89,11 +76,10 @@ fn kind_synonyms(kind: &str) -> Vec<&str> {
 
 pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
     let mut sql = format!(
-        "SELECT s.service, COALESCE(sv.path, s.service), s.file, s.start_line, s.signature,
+        "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}
          FROM symbols_fts f
          JOIN symbols s ON s.id = f.rowid
-         LEFT JOIN services sv ON sv.name = s.service
          WHERE symbols_fts MATCH ?1"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(fts_query(query))];
@@ -121,14 +107,7 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
     let mut stmt = conn.prepare(&sql)?;
     let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(pref.as_slice(), |r| {
-        Ok(row_to_pointer(
-            r.get(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-        ))
+        Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
     let mut any = false;
     for p in rows {
@@ -143,23 +122,15 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
 
 pub fn def(conn: &Connection, symbol: &str) -> Result<()> {
     let sql = format!(
-        "SELECT s.service, COALESCE(sv.path, s.service), s.file, s.start_line, s.signature,
+        "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}
          FROM symbols s
-         LEFT JOIN services sv ON sv.name = s.service
          WHERE s.name = ?1
          ORDER BY {INDEG_SQL} DESC, s.file, s.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([symbol], |r| {
-        Ok(row_to_pointer(
-            r.get(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get(4)?,
-            r.get(5)?,
-        ))
+        Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
     let mut any = false;
     for p in rows {
@@ -175,21 +146,20 @@ pub fn def(conn: &Connection, symbol: &str) -> Result<()> {
 pub fn callers(conn: &Connection, symbol: &str) -> Result<()> {
     // Callers = source symbols of edges whose dst is a symbol named `symbol`.
     let sql = format!(
-        "SELECT s.service, COALESCE(sv.path, s.service), s.file, s.start_line, s.signature,
+        "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}, e.kind
          FROM edges e
          JOIN symbols d ON d.id = e.dst_symbol
          JOIN symbols s ON s.id = e.src_symbol
-         LEFT JOIN services sv ON sv.name = s.service
          WHERE d.name = ?1
          GROUP BY s.id, e.kind
          ORDER BY s.file, s.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([symbol], |r| {
-        let kind: String = r.get(6)?;
+        let kind: String = r.get(4)?;
         Ok((
-            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
             kind,
         ))
     })?;
@@ -320,6 +290,29 @@ fn first_json_item(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_line_is_the_openable_repo_relative_path() {
+        // The path must be the file as indexed (repo-relative), NOT prefixed
+        // by the owning service's name — those diverge for manifest services.
+        let p = Pointer {
+            file: "fixtures/billing/src/Invoice.scala".into(),
+            start_line: 7,
+            signature: "case class Invoice(id: String)".into(),
+            enclosing: None,
+        };
+        assert_eq!(
+            p.line(""),
+            "fixtures/billing/src/Invoice.scala:L7  case class Invoice(id: String)  [-]"
+        );
+        let q = Pointer {
+            file: "a.rs".into(),
+            start_line: 1,
+            signature: String::new(),
+            enclosing: Some("outer".into()),
+        };
+        assert_eq!(q.line("  (call)"), "a.rs:L1  -  [outer]  (call)");
+    }
 
     #[test]
     fn fts_query_makes_each_word_a_prefix_term() {

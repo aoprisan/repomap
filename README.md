@@ -96,11 +96,16 @@ $ repomap --clear-db
 ### `index [--incremental]`
 
 (Re)indexes the repo. `--incremental` skips files whose git blob hash is
-unchanged since the last run, and drops symbols for deleted files.
+unchanged since the last run, and drops symbols for deleted files. If the
+service definitions changed since the last run (edited `repomap.toml`, or a
+changed inferred layout), an incremental request is upgraded to a full
+reindex — skipped files would otherwise keep stale service attribution.
 
 ```
 $ repomap index
 indexed 14 files (0 skipped, 0 removed), 97 symbols, 114 edges, 2 services [full]
+$ repomap index --incremental        # after editing repomap.toml
+indexed 14 files (0 skipped, 0 removed), 97 symbols, 114 edges, 1 services [full: service definitions changed]
 ```
 
 ### `map`
@@ -116,16 +121,17 @@ repomap  (rust)  12 files  main.rs
 ### `find <query> [--service S] [--kind K] [--lang L] [-k N]`
 
 Full-text symbol search. Each hit is one line:
-`service/path:Lstart  <signature>  [enclosing]`. `-k` caps results (default 10).
-`--kind` accepts the language-native kind (`fn`, `def`, `struct`, `object`, …)
-or a generic alias: `function` matches `fn`/`def`/`method`, `module` matches
+`path:Lstart  <signature>  [enclosing]`, where `path` is the repo-relative
+file path — openable as printed. `-k` caps results (default 10). `--kind`
+accepts the language-native kind (`fn`, `def`, `struct`, `object`, …) or a
+generic alias: `function` matches `fn`/`def`/`method`, `module` matches
 `mod`.
 
 ```
 $ repomap find Invoice -k 3
-billing/src/main/scala/billing/Invoice.scala:L14  object InvoiceService extends Repository[Invoice]  [-]
-billing/src/main/scala/billing/Invoice.scala:L7  case class Invoice(id: String, amountCents: Long, currency: String)  [-]
-billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
+fixtures/billing/src/main/scala/billing/Invoice.scala:L14  object InvoiceService extends Repository[Invoice]  [-]
+fixtures/billing/src/main/scala/billing/Invoice.scala:L7  case class Invoice(id: String, amountCents: Long, currency: String)  [-]
+fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
 ```
 
 ### `def <symbol>`
@@ -134,7 +140,7 @@ Definition site(s) of a symbol, one line each.
 
 ```
 $ repomap def TaxCalculator
-billing/src/main/scala/billing/tax/TaxCalculator.scala:L3  object TaxCalculator  [-]
+fixtures/billing/src/main/scala/billing/tax/TaxCalculator.scala:L3  object TaxCalculator  [-]
 ```
 
 ### `callers <symbol>`
@@ -144,7 +150,7 @@ one line each.
 
 ```
 $ repomap callers get
-billing/src/main/scala/billing/Invoice.scala:L23  val base = get(id).map(_.amountCents).getOrElse(0L)  [total]  (call)
+fixtures/billing/src/main/scala/billing/Invoice.scala:L23  val base = get(id).map(_.amountCents).getOrElse(0L)  [total]  (call)
 ```
 
 > **Note:** edges are resolved best-effort by name, **scoped to the source's own
@@ -169,6 +175,9 @@ deps = []
 ```
 
 A file is assigned to the service whose `path` is the longest matching prefix.
+Files that fall under no declared `path` land in a synthetic `root` service
+(shown in `map` only if it actually owns files), so a partial manifest never
+misattributes them to a sibling service.
 
 ## How it works
 

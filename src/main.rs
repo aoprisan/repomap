@@ -63,7 +63,6 @@ fn main() -> Result<()> {
     match cmd {
         Cmd::Index { incremental } => {
             let s = index::run(&mut conn, &root, incremental, &db_file)?;
-            let mode = if incremental { "incremental" } else { "full" };
             println!(
                 "indexed {} files ({} skipped, {} removed), {} symbols, {} edges, {} services [{}]",
                 s.files_indexed,
@@ -72,7 +71,7 @@ fn main() -> Result<()> {
                 s.symbols,
                 s.edges,
                 s.services,
-                mode
+                s.mode
             );
         }
         Cmd::Map => query::map(&conn)?,

@@ -19,6 +19,8 @@ pub enum Language {
     Ruby,
     Python,
     Typescript,
+    /// `.tsx` — same query as TypeScript but the JSX-aware grammar.
+    Tsx,
     // Elm — later: add an arm to each match below.
 }
 
@@ -30,7 +32,8 @@ impl Language {
             "rs" => Some(Language::Rust),
             "rb" => Some(Language::Ruby),
             "py" => Some(Language::Python),
-            "ts" | "tsx" => Some(Language::Typescript),
+            "ts" => Some(Language::Typescript),
+            "tsx" => Some(Language::Tsx),
             _ => None,
         }
     }
@@ -41,7 +44,8 @@ impl Language {
             Language::Rust => "rust",
             Language::Ruby => "ruby",
             Language::Python => "python",
-            Language::Typescript => "typescript",
+            // Both grammars index (and are queried) as one language.
+            Language::Typescript | Language::Tsx => "typescript",
         }
     }
 
@@ -52,6 +56,7 @@ impl Language {
             Language::Ruby => ruby::language(),
             Language::Python => python::language(),
             Language::Typescript => typescript::language(),
+            Language::Tsx => typescript::language_tsx(),
         }
     }
 
@@ -61,7 +66,7 @@ impl Language {
             Language::Rust => rust::QUERY,
             Language::Ruby => ruby::QUERY,
             Language::Python => python::QUERY,
-            Language::Typescript => typescript::QUERY,
+            Language::Typescript | Language::Tsx => typescript::QUERY,
         }
     }
 
@@ -98,7 +103,7 @@ mod tests {
         assert_eq!(Language::from_path(Path::new("a.rb")), Some(Language::Ruby));
         assert_eq!(Language::from_path(Path::new("a.py")), Some(Language::Python));
         assert_eq!(Language::from_path(Path::new("a.ts")), Some(Language::Typescript));
-        assert_eq!(Language::from_path(Path::new("a.tsx")), Some(Language::Typescript));
+        assert_eq!(Language::from_path(Path::new("a.tsx")), Some(Language::Tsx));
         assert_eq!(Language::from_path(Path::new("a.txt")), None);
         assert_eq!(Language::from_path(Path::new("noext")), None);
     }
@@ -234,5 +239,24 @@ const arrow = (y: number) => helper(y);
         assert!(has_edge(&e, "extends", "Base"), "extends edge to Base");
         assert!(has_edge(&e, "extends", "Drawable"), "implements edge to Drawable");
         assert!(has_edge(&e, "import", "Base"), "named import Base");
+    }
+
+    #[test]
+    fn tsx_extraction_survives_jsx() {
+        // With the plain-TS grammar this file parsed into errors and yielded
+        // zero symbols — even `after`, which sits below the JSX.
+        let src = "\
+const Card = ({t}: {t: string}) => <div className=\"c\">{t}</div>;
+export function List(items: string[]) {
+  return <ul>{items.map(i => <Card t={i}/>)}</ul>;
+}
+export function after(): number { return render(1); }
+";
+        let e = Language::Tsx.extract(src).unwrap();
+
+        assert_eq!(symbol(&e, "Card").kind, "function");
+        assert_eq!(symbol(&e, "List").kind, "function");
+        assert_eq!(symbol(&e, "after").kind, "function");
+        assert!(has_edge(&e, "call", "render"), "call edge inside a TSX file");
     }
 }
