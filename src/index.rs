@@ -97,31 +97,55 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
         bar.set_message(c.rel.clone());
         seen.insert(c.rel.clone());
         let abs = root.join(&c.rel);
+        let (mtime, size) = stat(&abs);
+
+        if incremental {
+            let stored: Option<(String, i64, i64)> = tx
+                .query_row(
+                    "SELECT git_hash, mtime, size FROM files WHERE path = ?1",
+                    [&c.rel],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            if let Some((stored_hash, stored_mtime, stored_size)) = stored {
+                // Fast path: an untouched stat means an unchanged file — skip
+                // without even reading it.
+                if mtime == stored_mtime && size == stored_size && mtime != 0 {
+                    skipped += 1;
+                    continue;
+                }
+                // Stat moved (e.g. touch, checkout): confirm via content hash.
+                let bytes = match std::fs::read(&abs) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let hash = git::blob_hash(&bytes);
+                if hash == stored_hash {
+                    tx.execute(
+                        "UPDATE files SET mtime = ?1, size = ?2 WHERE path = ?3",
+                        rusqlite::params![mtime, size, c.rel],
+                    )?;
+                    skipped += 1;
+                    continue;
+                }
+                // Changed file: clear its prior rows (cascades symbols/edges).
+                tx.execute("DELETE FROM files WHERE path = ?1", [&c.rel])?;
+                let src = String::from_utf8_lossy(&bytes);
+                let service = resolver.resolve(&c.rel);
+                index_file(&tx, &c.rel, c.lang, service, &src, &hash, mtime, size, now)?;
+                indexed += 1;
+                continue;
+            }
+        }
+
         let bytes = match std::fs::read(&abs) {
             Ok(b) => b,
             Err(_) => continue,
         };
         let hash = git::blob_hash(&bytes);
-
-        if incremental {
-            let unchanged: bool = tx
-                .query_row(
-                    "SELECT git_hash = ?1 FROM files WHERE path = ?2",
-                    rusqlite::params![hash, c.rel],
-                    |r| r.get(0),
-                )
-                .unwrap_or(false);
-            if unchanged {
-                skipped += 1;
-                continue;
-            }
-            // Changed file: clear its prior rows (cascades symbols/edges).
-            tx.execute("DELETE FROM files WHERE path = ?1", [&c.rel])?;
-        }
-
         let src = String::from_utf8_lossy(&bytes);
         let service = resolver.resolve(&c.rel);
-        index_file(&tx, &c.rel, c.lang, service, &src, &hash, now)?;
+        index_file(&tx, &c.rel, c.lang, service, &src, &hash, mtime, size, now)?;
         indexed += 1;
     }
 
@@ -267,6 +291,7 @@ fn write_services(conn: &Connection, resolver: &Resolver) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_file(
     tx: &rusqlite::Transaction,
     rel: &str,
@@ -274,12 +299,23 @@ fn index_file(
     service: &Service,
     src: &str,
     hash: &str,
+    mtime: i64,
+    size: i64,
     now: i64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO files(path, service, language, loc, git_hash, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        rusqlite::params![rel, service.name, lang.name(), git::loc(src) as i64, hash, now],
+        "INSERT INTO files(path, service, language, loc, git_hash, mtime, size, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        rusqlite::params![
+            rel,
+            service.name,
+            lang.name(),
+            git::loc(src) as i64,
+            hash,
+            mtime,
+            size,
+            now
+        ],
     )?;
 
     let extracted = lang.extract(src)?;
@@ -308,11 +344,19 @@ fn index_file(
         }
     }
 
-    // Attribute each edge to its innermost enclosing symbol.
+    // Attribute each edge to its innermost enclosing symbol. Imports are also
+    // recorded per *file* (even top-level ones with no enclosing symbol):
+    // they license cross-service resolution for that name from this file.
     {
         let mut stmt =
             tx.prepare("INSERT INTO edge_raw(src_symbol, dst_name, kind) VALUES (?1, ?2, ?3)")?;
+        let mut imp = tx.prepare(
+            "INSERT OR IGNORE INTO file_imports(file, name) VALUES (?1, ?2)",
+        )?;
         for e in &extracted.edges {
+            if e.kind == "import" {
+                imp.execute(rusqlite::params![rel, e.dst_name])?;
+            }
             if let Some(src_id) = enclosing(&spans, e.src_line) {
                 stmt.execute(rusqlite::params![src_id, e.dst_name, e.kind])?;
             }
@@ -333,12 +377,17 @@ fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
 /// Rebuild `edges` from `edge_raw`, resolving each dst name to a single
 /// symbol id. Best-effort, deliberately conservative:
 ///
-/// * Resolution is scoped to the **same service** as the source. Bare names
-///   are ambiguous across a monorepo — a Rust `map.get(..)` and a Scala
+/// * A bare name resolves within the **same service** as the source. Bare
+///   names are ambiguous across a monorepo — a Rust `map.get(..)` and a Scala
 ///   `repo.get(..)` both surface a `get` reference, and there is no reliable
-///   way to link those across services by name alone. Rather than guess (and
-///   cross-link `get`/`apply`/`new` to whatever unrelated symbol sorts first),
-///   we drop a reference that has no same-service definition.
+///   way to link those across services by name alone.
+/// * A name the source **file imports** may additionally resolve across
+///   service boundaries: the import is explicit evidence the reference points
+///   outside, so `use billing::TaxCalculator` lets a `TaxCalculator` call
+///   land on billing's definition. Same-service definitions still win the tie.
+/// * A reference that is neither defined in the source's service nor imported
+///   is dropped rather than guessed — so we never cross-link `get`/`apply`-
+///   style common names to unrelated symbols in other services.
 /// * Within a service, a definition in the **same file** wins, then lowest id.
 /// * **Self-edges are excluded** so a symbol is never its own caller (e.g. a
 ///   recursive call, or a method whose body references its own name).
@@ -352,13 +401,47 @@ fn resolve_edges(tx: &rusqlite::Transaction) -> Result<()> {
          JOIN symbols d ON d.id = (
              SELECT s.id FROM symbols s
              WHERE s.name = er.dst_name
-               AND s.service = src.service
                AND s.id <> er.src_symbol
-             ORDER BY (s.file = src.file) DESC, s.id
+               AND (s.service = src.service
+                    OR EXISTS (SELECT 1 FROM file_imports fi
+                               WHERE fi.file = src.file AND fi.name = er.dst_name))
+             ORDER BY (s.file = src.file) DESC, (s.service = src.service) DESC, s.id
              LIMIT 1
          )",
         [],
     )?;
+    Ok(())
+}
+
+/// mtime (ns since epoch) + size for the incremental fast path; (0, 0) when
+/// the stat fails, which never matches a stored row and forces the hash path.
+fn stat(path: &Path) -> (i64, i64) {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            (mtime, m.len() as i64)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Bring the index up to date before answering a query: a full index when
+/// nothing is indexed yet, an incremental one otherwise. Reports to stderr
+/// only when something actually changed, so fresh-index queries stay silent.
+pub fn refresh(conn: &mut Connection, root: &Path, db_file: &Path) -> Result<()> {
+    let files: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?;
+    let s = run(conn, root, files > 0, db_file)?;
+    if s.files_indexed > 0 || s.files_removed > 0 {
+        eprintln!(
+            "index refreshed: {} files reindexed, {} removed [{}]",
+            s.files_indexed, s.files_removed, s.mode
+        );
+    }
     Ok(())
 }
 
@@ -595,6 +678,89 @@ mod tests {
         let s2 = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s2.mode, "incremental");
         assert!(s2.files_skipped > 0);
+    }
+
+    #[test]
+    fn import_licenses_a_cross_service_edge() {
+        // Same layout as drops_cross_service_references, but svca explicitly
+        // imports `helper` — that evidence lets the edge cross the boundary.
+        let (conn, _dir) = index_repo(&[
+            ("svca/a.rs", "use svcb::helper;\npub fn caller() { helper(); }\n"),
+            ("svcb/b.rs", "pub fn helper() {}\n"),
+        ]);
+        assert!(
+            edge_exists(&conn, "caller", "helper"),
+            "an imported name must resolve across services"
+        );
+        assert_eq!(dst_file_of(&conn, "caller").as_deref(), Some("svcb/b.rs"));
+    }
+
+    #[test]
+    fn same_service_definition_beats_an_imported_one() {
+        // `helper` exists both in the caller's own service and (imported) in
+        // another; the local definition must win.
+        let (conn, _dir) = index_repo(&[
+            (
+                "svca/a.rs",
+                "use svcb::helper;\npub fn caller() { helper(); }\npub fn helper() {}\n",
+            ),
+            ("svcb/b.rs", "pub fn helper() {}\n"),
+        ]);
+        assert_eq!(dst_file_of(&conn, "caller").as_deref(), Some("svca/a.rs"));
+    }
+
+    #[test]
+    fn unimported_names_still_do_not_cross_services() {
+        // The conservative default survives: importing one name does not open
+        // the door for every other bare reference in the file.
+        let (conn, _dir) = index_repo(&[
+            ("svca/a.rs", "use svcb::other;\npub fn caller() { helper(); }\n"),
+            ("svcb/b.rs", "pub fn helper() {}\npub fn other() {}\n"),
+        ]);
+        assert!(!edge_exists(&conn, "caller", "helper"));
+    }
+
+    #[test]
+    fn refresh_indexes_an_empty_db_then_picks_up_edits() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn f() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+
+        // Nothing indexed yet: refresh runs a full index.
+        refresh(&mut conn, dir.path(), &db_path).unwrap();
+        assert!(symbol_exists(&conn, "f"));
+
+        // Edit a file: the next refresh (incremental) sees it.
+        std::fs::write(dir.path().join("svc/a.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+        refresh(&mut conn, dir.path(), &db_path).unwrap();
+        assert!(symbol_exists(&conn, "g"));
+
+        // Delete it: refresh purges its symbols.
+        std::fs::remove_file(dir.path().join("svc/a.rs")).unwrap();
+        refresh(&mut conn, dir.path(), &db_path).unwrap();
+        assert!(!symbol_exists(&conn, "f"));
+    }
+
+    #[test]
+    fn stat_fast_path_skips_without_reading_but_survives_a_touch() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn f() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+
+        // Unchanged: skipped (via the stat fast path when mtimes are stable).
+        let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!((s.files_indexed, s.files_skipped), (0, 1));
+
+        // Same content, forced-new mtime: the hash fallback still skips it.
+        let path = dir.path().join("svc/a.rs");
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+        let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!((s.files_indexed, s.files_skipped), (0, 1));
     }
 
     #[test]

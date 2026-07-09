@@ -36,6 +36,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub clear_db: bool,
 
+    /// Skip the automatic index refresh that query commands run first;
+    /// answer from the index as-is (possibly stale).
+    #[arg(long, global = true)]
+    pub no_refresh: bool,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
 }
@@ -65,4 +70,9 @@ pub enum Cmd {
     Def { symbol: String },
     /// Symbols with an edge pointing at <symbol>, one line each.
     Callers { symbol: String },
+    /// Symbols that <symbol> points at (calls, extends, imports), one line each.
+    Callees { symbol: String },
+    /// All symbols defined in <file> (exact repo-relative path, or a path
+    /// suffix like `Invoice.scala`), in source order.
+    Outline { file: String },
 }

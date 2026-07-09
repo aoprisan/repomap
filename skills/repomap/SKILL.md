@@ -16,14 +16,19 @@ usually replaces many file reads when you need to locate a symbol, see its
 callers, or understand how the repo is organized. Once it points you at a
 `file:line`, open that exact spot to read the actual code.
 
-## Setup (once per repo)
+## Setup (none required)
 
-The index lives in `./.repomap.db`. If queries say "not indexed yet" or return
-nothing, build it first:
+The index lives in `./.repomap.db` and **maintains itself**: every query
+command first refreshes the index (a full build on first use, an incremental
+one after), so you can run `repomap find …` immediately and after editing
+files — results always reflect the working tree. Pass `--no-refresh` to answer
+from the index as-is.
+
+To build or refresh explicitly:
 
 ```sh
 repomap index                 # full (re)index of the repo
-repomap index --incremental   # skip files whose git blob hash is unchanged
+repomap index --incremental   # skip unchanged files (stat, then git-hash check)
 ```
 
 (`--incremental` automatically upgrades to a full reindex if the service
@@ -77,25 +82,46 @@ who uses it. Each line ends with the edge kind, e.g. `(call)`.
 repomap callers get
 ```
 
-> **Caveat:** edges are resolved best-effort by name, **scoped to the source's
-> own service** (same-file definition preferred). A bare reference with no
-> same-service definition is dropped rather than guessed — so `callers` can miss
-> genuine cross-service calls. Treat its output as a strong hint, not an
-> exhaustive list, and confirm by reading the cited `file:line`.
+### `repomap callees <symbol>`
+The inverse: symbols that `<symbol>` points at — what it calls, extends, or
+imports. Use it to see a function's dependencies before changing it.
+
+```sh
+repomap callees total
+```
+
+> **Caveat:** edges are resolved best-effort by name. A bare reference resolves
+> within the source's **own service** (same-file definition preferred); a name
+> the source file **imports** may also resolve across services. Anything else
+> is dropped rather than guessed — so `callers`/`callees` can still miss some
+> cross-service links. Treat their output as a strong hint, not an exhaustive
+> list, and confirm by reading the cited `file:line`.
+
+### `repomap outline <file>`
+All symbols defined in one file, in source order. Accepts the exact
+repo-relative path or a suffix (`outline Invoice.scala`). Run this **before
+editing a file** to see its shape without reading it whole.
+
+```sh
+repomap outline src/query.rs
+repomap outline Invoice.scala
+```
 
 ## Typical workflow
 
 1. `repomap map` — see the services and stacks at a glance.
 2. `repomap find <name>` — locate candidate symbols by fuzzy name.
 3. `repomap def <name>` — pin the exact definition site(s).
-4. `repomap callers <name>` — see who depends on it before changing it.
-5. Open the reported `path:Lstart` to read the real code.
+4. `repomap callers <name>` / `repomap callees <name>` — see who depends on it
+   and what it depends on before changing it.
+5. `repomap outline <file>` — map a file's shape before opening or editing it.
+6. Open the reported `path:Lstart` to read the real code.
 
 ## Notes
 
 - Results are **pointers, not code** — always open the cited location to read or
   edit the actual source.
-- If results look stale after you edit files, re-run `repomap index
-  --incremental`.
+- Query results are never stale: each query auto-refreshes the index against
+  the working tree first (`--no-refresh` skips this).
 - Languages indexed today: Rust, Scala, Ruby, Python, TypeScript. Symbols in
   other languages won't appear.

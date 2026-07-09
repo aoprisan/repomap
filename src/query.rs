@@ -36,11 +36,18 @@ impl Pointer {
     }
 }
 
-// SQL fragment computing the innermost enclosing symbol name for `s`.
+// SQL fragment computing the innermost enclosing symbol name for the symbol
+// aliased `s` (the alias used by every query that selects pointers directly).
 const ENCLOSING_SQL: &str = "(SELECT p.name FROM symbols p
      WHERE p.file = s.file AND p.id <> s.id
        AND p.start_line <= s.start_line AND p.end_line >= s.end_line
      ORDER BY (p.end_line - p.start_line) ASC LIMIT 1)";
+
+/// `ENCLOSING_SQL` for an arbitrary symbols alias (e.g. the edge dst in
+/// `callees`, where the pointer row is aliased `d`).
+fn enclosing_sql(alias: &str) -> String {
+    ENCLOSING_SQL.replace("s.", &format!("{alias}."))
+}
 
 // SQL fragment for in-degree (incoming edges), the find tie-breaker.
 const INDEG_SQL: &str = "(SELECT count(*) FROM edges WHERE dst_symbol = s.id)";
@@ -172,6 +179,68 @@ pub fn callers(conn: &Connection, symbol: &str) -> Result<()> {
     if !any {
         eprintln!("no callers for '{symbol}'");
     }
+    Ok(())
+}
+
+pub fn callees(conn: &Connection, symbol: &str) -> Result<()> {
+    // Callees = destination symbols of edges whose src is named `symbol`.
+    let enclosing_d = enclosing_sql("d");
+    let sql = format!(
+        "SELECT d.file, d.start_line, d.signature,
+                {enclosing_d}, e.kind
+         FROM edges e
+         JOIN symbols s ON s.id = e.src_symbol
+         JOIN symbols d ON d.id = e.dst_symbol
+         WHERE s.name = ?1
+         GROUP BY d.id, e.kind
+         ORDER BY d.file, d.start_line"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([symbol], |r| {
+        let kind: String = r.get(4)?;
+        Ok((
+            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
+            kind,
+        ))
+    })?;
+    let mut any = false;
+    for row in rows {
+        let (p, kind) = row?;
+        p.print(&format!("  ({kind})"));
+        any = true;
+    }
+    if !any {
+        eprintln!("no callees for '{symbol}'");
+    }
+    Ok(())
+}
+
+pub fn outline(conn: &Connection, file: &str) -> Result<()> {
+    // Exact repo-relative path first; fall back to a suffix match so
+    // `outline Invoice.scala` works without spelling the full path.
+    let base = format!(
+        "SELECT s.file, s.start_line, s.signature,
+                {ENCLOSING_SQL}
+         FROM symbols s"
+    );
+    let exact = format!("{base} WHERE s.file = ?1 ORDER BY s.start_line");
+    let suffix = format!("{base} WHERE s.file LIKE '%' || ?1 ORDER BY s.file, s.start_line");
+
+    for sql in [&exact, &suffix] {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([file], |r| {
+            Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        let mut any = false;
+        for p in rows {
+            p?.print("");
+            any = true;
+        }
+        if any {
+            return Ok(());
+        }
+    }
+    eprintln!("no symbols for '{file}' (not indexed, or no definitions in it)");
     Ok(())
 }
 
@@ -312,6 +381,14 @@ mod tests {
             enclosing: Some("outer".into()),
         };
         assert_eq!(q.line("  (call)"), "a.rs:L1  -  [outer]  (call)");
+    }
+
+    #[test]
+    fn enclosing_sql_rebinds_the_symbol_alias() {
+        let d = enclosing_sql("d");
+        assert!(d.contains("p.file = d.file"));
+        assert!(d.contains("d.start_line") && d.contains("d.end_line"));
+        assert!(!d.contains("s."), "no stale references to the old alias");
     }
 
     #[test]
