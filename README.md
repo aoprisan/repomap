@@ -14,7 +14,13 @@ Languages supported today: **Rust**, **Scala**, **Ruby**, **Python**, and
 
 ## Install
 
-Build a release binary and copy it onto your `PATH` in one step:
+Prebuilt binaries for Linux (gnu + static musl) and macOS (Intel + Apple
+Silicon) are attached to [GitHub
+releases](https://github.com/aoprisan/repomap/releases) — download, extract,
+and drop `repomap` on your `PATH`. (Tagging `v*` builds them via
+`.github/workflows/release.yml`.)
+
+Or build from source and copy it onto your `PATH` in one step:
 
 ```sh
 cargo build --release
@@ -63,10 +69,17 @@ callers, and map services instead of broad file reads.
 
 ```sh
 cd your-monorepo
-repomap index        # build/refresh the index (writes ./.repomap.db)
 repomap map          # list services
 repomap find Invoice # search symbols
 ```
+
+No setup step: **query commands refresh the index automatically** before
+answering — a full build on first use (writing `./.repomap.db`), an
+incremental one after — so results always reflect the working tree, even right
+after you edit files. When a refresh actually reindexed something, a one-line
+note goes to stderr; pass `--no-refresh` to answer from the index as-is.
+`repomap index` is still there for building explicitly (e.g. in CI or a
+pre-commit hook).
 
 Global flags (valid on any subcommand):
 
@@ -74,6 +87,7 @@ Global flags (valid on any subcommand):
 |------|---------|---------|
 | `--root <dir>` | `.` | Repo root to index/query |
 | `--db <path>` | `<root>/.repomap.db` | Index database location |
+| `--no-refresh` | | Skip the automatic index refresh before a query |
 | `--show-db` | | Print the resolved database path and stats, then exit |
 | `--clear-db` | | Delete the resolved database (and its WAL/SHM sidecars), then exit |
 
@@ -111,11 +125,12 @@ $ repomap --clear-db
 
 ### `index [--incremental]`
 
-(Re)indexes the repo. `--incremental` skips files whose git blob hash is
-unchanged since the last run, and drops symbols for deleted files. If the
-service definitions changed since the last run (edited `repomap.toml`, or a
-changed inferred layout), an incremental request is upgraded to a full
-reindex — skipped files would otherwise keep stale service attribution.
+(Re)indexes the repo. `--incremental` skips unchanged files — first on a cheap
+stat (mtime + size), falling back to the git blob hash when the stat moved —
+and drops symbols for deleted files. If the service definitions changed since
+the last run (edited `repomap.toml`, or a changed inferred layout), an
+incremental request is upgraded to a full reindex — skipped files would
+otherwise keep stale service attribution.
 
 ```
 $ repomap index
@@ -169,11 +184,35 @@ $ repomap callers get
 fixtures/billing/src/main/scala/billing/Invoice.scala:L23  val base = get(id).map(_.amountCents).getOrElse(0L)  [total]  (call)
 ```
 
-> **Note:** edges are resolved best-effort by name, **scoped to the source's own
-> service** (same-file definition preferred). A bare reference with no
-> same-service definition is dropped rather than guessed — so `callers` will
-> miss genuine cross-service calls, but won't cross-link `get`/`apply`-style
-> common names to unrelated symbols in other services.
+> **Note:** edges are resolved best-effort by name. A bare reference resolves
+> within the source's **own service** (same-file definition preferred). A name
+> the source file **imports** may additionally resolve across service
+> boundaries — the import is explicit evidence the reference points outside.
+> Anything else is dropped rather than guessed, so `get`/`apply`-style common
+> names never cross-link to unrelated symbols in other services.
+
+### `callees <symbol>`
+
+The inverse of `callers`: symbols that `<symbol>` has an edge pointing at —
+what it calls, extends, or imports.
+
+```
+$ repomap callees total
+fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]  (call)
+```
+
+### `outline <file>`
+
+All symbols defined in one file, in source order. `<file>` is the exact
+repo-relative path, or a path suffix when that's unambiguous enough
+(`outline Invoice.scala`).
+
+```
+$ repomap outline fixtures/billing/src/main/scala/billing/Invoice.scala
+fixtures/billing/src/main/scala/billing/Invoice.scala:L7  case class Invoice(id: String, amountCents: Long, currency: String)  [-]
+fixtures/billing/src/main/scala/billing/Invoice.scala:L14  object InvoiceService extends Repository[Invoice]  [-]
+fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
+```
 
 ## Services
 
@@ -204,10 +243,16 @@ misattributes them to a sibling service.
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.
 - **Store** — symbols and FTS live in SQLite (bundled rusqlite, FTS5). Edges are
   stored name-keyed in `edge_raw`, then rebuilt into `edges` on each index run
-  by resolving destination names to symbol ids — same-service only, same-file
-  preferred, self-edges excluded (see the note under `callers`).
-- **Incremental** — indexing keys on each file's git blob hash (pure-Rust,
-  `git hash-object`-compatible) to skip unchanged files.
+  by resolving destination names to symbol ids — same service, or cross-service
+  when the source file imports the name; same-file preferred, self-edges
+  excluded (see the note under `callers`). Imported names are recorded per file
+  in `file_imports`, including top-level imports.
+- **Incremental** — a file is skipped when its stat (mtime + size) is
+  untouched, or — when the stat moved — its git blob hash (pure-Rust,
+  `git hash-object`-compatible) still matches. Query commands run an
+  incremental pass automatically before answering.
+- **Migrations** — the database is a cache: on a schema-version bump, `repomap`
+  drops and rebuilds it on the next (auto-)index instead of migrating in place.
 
 ## Adding a language
 

@@ -60,6 +60,17 @@ fn main() -> Result<()> {
         }
     };
 
+    // Query commands answer from a live index: refresh first (full when
+    // nothing is indexed yet, incremental otherwise) so an agent that just
+    // edited files never follows stale line numbers. `--no-refresh` opts out,
+    // and a refresh failure (e.g. read-only checkout) degrades to a warning
+    // rather than blocking the query.
+    if !matches!(cmd, Cmd::Index { .. }) && !args.no_refresh {
+        if let Err(e) = index::refresh(&mut conn, &root, &db_file) {
+            eprintln!("warning: index refresh failed ({e}); answering from the existing index");
+        }
+    }
+
     match cmd {
         Cmd::Index { incremental } => {
             let s = index::run(&mut conn, &root, incremental, &db_file)?;
@@ -93,6 +104,8 @@ fn main() -> Result<()> {
         )?,
         Cmd::Def { symbol } => query::def(&conn, &symbol)?,
         Cmd::Callers { symbol } => query::callers(&conn, &symbol)?,
+        Cmd::Callees { symbol } => query::callees(&conn, &symbol)?,
+        Cmd::Outline { file } => query::outline(&conn, &file)?,
     }
     Ok(())
 }
