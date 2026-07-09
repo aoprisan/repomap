@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::skill::Agent;
+
 #[derive(Parser)]
 #[command(name = "repomap", version, about = "Compact code-navigation index for LLM agents")]
 pub struct Cli {
@@ -15,9 +17,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub install: bool,
 
-    /// Install the bundled Claude Code skill into `<root>/.claude` and exit.
-    #[arg(long, global = true)]
-    pub install_skill: bool,
+    /// Install the bundled repomap guide for a coding agent into `<root>` and
+    /// exit. Target one of `claude` (default), `copilot`, or `codex`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "AGENT",
+        num_args = 0..=1,
+        default_missing_value = "claude"
+    )]
+    pub install_skill: Option<Agent>,
 
     /// Print the resolved index database path (with stats) and exit.
     #[arg(long, global = true)]
