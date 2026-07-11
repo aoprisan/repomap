@@ -6,10 +6,15 @@ use rusqlite::Connection;
 /// Bumped whenever the schema changes shape. The index is derived data — a
 /// cache over the working tree — so migration is simply "drop and let the
 /// next (auto-)index rebuild", never an ALTER dance.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Query commands auto-refresh the index first, so two concurrent repomap
+    // invocations (an agent running commands in parallel is the normal case)
+    // can hit the database at once. Without a busy timeout the loser gets an
+    // immediate SQLITE_BUSY error instead of briefly waiting its turn.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
 
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -68,8 +73,13 @@ CREATE TABLE IF NOT EXISTS symbols (
   service        TEXT NOT NULL,
   language       TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
-CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file);
+-- Composite indexes sized for edge resolution: each resolver tier is an
+-- exact-range probe (name+service / file+name) whose entries are already in
+-- id order, so `ORDER BY id LIMIT 1` stops after a row or two. Name-only and
+-- file-only lookups (def, outline, enclosing) use the same indexes as
+-- prefixes.
+CREATE INDEX IF NOT EXISTS idx_sym_name_service ON symbols(name, service);
+CREATE INDEX IF NOT EXISTS idx_sym_file_name ON symbols(file, name);
 
 -- Best-effort references keyed by dst *name*; resolved into `edges` after
 -- each index run. Cascades away when its source symbol (and file) is dropped.
@@ -124,6 +134,15 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_sets_a_busy_timeout_for_concurrent_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let conn = open(path.to_str().unwrap()).unwrap();
+        let ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert!(ms >= 1000, "busy_timeout must be set, got {ms} ms");
+    }
 
     #[test]
     fn open_stamps_the_schema_version() {
