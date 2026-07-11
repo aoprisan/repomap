@@ -125,7 +125,14 @@ $ repomap --clear-db
 
 ### `index [--incremental]`
 
-(Re)indexes the repo. `--incremental` skips unchanged files — first on a cheap
+(Re)indexes the repo. The scan honors `.gitignore`/`.ignore` rules (even in a
+tree exported without `.git`, though not your machine-global gitignore), always
+skips dependency/cache directories (`node_modules`, `target`, virtualenvs, …)
+as a fallback, and drops files over 1 MiB — hand-written source essentially
+never gets that big, generated bundles routinely do. Files are parsed and
+extracted in parallel across CPU cores.
+
+`--incremental` skips unchanged files — first on a cheap
 stat (mtime + size), falling back to the git blob hash when the stat moved —
 and drops symbols for deleted files. If the service definitions changed since
 the last run (edited `repomap.toml`, or a changed inferred layout), an
@@ -236,8 +243,13 @@ misattributes them to a sibling service.
 
 ## How it works
 
-- **Parse** — tree-sitter parses each file; one `.scm` query per language under
-  `queries/` declares what to capture.
+- **Scan** — the walk (via the `ignore` crate) honors `.gitignore`/`.ignore`,
+  falls back to a built-in skip list for dependency/cache directories, and
+  drops files over 1 MiB. Entries are sorted so symbol ids — and edge-
+  resolution tie-breaks — are deterministic across runs.
+- **Parse** — tree-sitter parses files in parallel (rayon); one `.scm` query
+  per language under `queries/` declares what to capture, compiled once per
+  grammar and shared across threads.
 - **Extract** — `src/lang/extract.rs` is language-agnostic, driven by
   capture-name conventions: `@def.<kind>` + `@name` → a symbol;
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.

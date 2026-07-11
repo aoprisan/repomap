@@ -11,6 +11,9 @@ mod typescript;
 pub use extract::Extracted;
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+use tree_sitter::Query;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Language {
@@ -60,19 +63,37 @@ impl Language {
         }
     }
 
-    fn query_src(&self) -> &'static str {
+    /// The compiled query for this grammar, built once and reused for every
+    /// file (including across indexing threads — `Query` is `Sync`).
+    /// Compiling the query is the expensive half of extraction; doing it per
+    /// file dominated indexing time. Tsx shares TypeScript's query *source*
+    /// but needs its own compiled copy, since a `Query` is bound to the
+    /// grammar it was compiled against. The sources are bundled and every
+    /// language is exercised by tests, so a compile failure here is a build
+    /// defect, not a runtime condition — hence the `expect`.
+    fn compiled_query(&self) -> &'static Query {
+        fn get(cell: &'static OnceLock<Query>, lang: tree_sitter::Language, src: &str) -> &'static Query {
+            cell.get_or_init(|| Query::new(&lang, src).expect("bundled tree-sitter query must compile"))
+        }
+        macro_rules! cached {
+            ($lang:expr, $src:expr) => {{
+                static Q: OnceLock<Query> = OnceLock::new();
+                get(&Q, $lang, $src)
+            }};
+        }
         match self {
-            Language::Scala => scala::QUERY,
-            Language::Rust => rust::QUERY,
-            Language::Ruby => ruby::QUERY,
-            Language::Python => python::QUERY,
-            Language::Typescript | Language::Tsx => typescript::QUERY,
+            Language::Scala => cached!(scala::language(), scala::QUERY),
+            Language::Rust => cached!(rust::language(), rust::QUERY),
+            Language::Ruby => cached!(ruby::language(), ruby::QUERY),
+            Language::Python => cached!(python::language(), python::QUERY),
+            Language::Typescript => cached!(typescript::language(), typescript::QUERY),
+            Language::Tsx => cached!(typescript::language_tsx(), typescript::QUERY),
         }
     }
 
     /// Extract symbols + best-effort edges from one file's source.
     pub fn extract(&self, src: &str) -> anyhow::Result<Extracted> {
-        extract::extract(src, &self.ts_language(), self.query_src())
+        extract::extract(src, &self.ts_language(), self.compiled_query())
     }
 }
 

@@ -10,6 +10,11 @@ const SCHEMA_VERSION: i32 = 2;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
+    // Query commands auto-refresh the index first, so two concurrent repomap
+    // invocations (an agent running commands in parallel is the normal case)
+    // can hit the database at once. Without a busy timeout the loser gets an
+    // immediate SQLITE_BUSY error instead of briefly waiting its turn.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
 
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
@@ -124,6 +129,15 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_sets_a_busy_timeout_for_concurrent_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let conn = open(path.to_str().unwrap()).unwrap();
+        let ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        assert!(ms >= 1000, "busy_timeout must be set, got {ms} ms");
+    }
 
     #[test]
     fn open_stamps_the_schema_version() {

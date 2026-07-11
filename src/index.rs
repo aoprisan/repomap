@@ -1,18 +1,22 @@
-//! Indexing: walk the repo, detect language/service, write symbols + raw
-//! edges per file (incremental by git blob hash), then resolve edges by name.
+//! Indexing: walk the repo (honoring .gitignore), detect language/service,
+//! parse + extract in parallel, write symbols + raw edges per file
+//! (incremental by git blob hash), then resolve edges by name.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
+use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use rusqlite::Connection;
-use walkdir::WalkDir;
 
 use crate::git;
-use crate::lang::Language;
+use crate::lang::{Extracted, Language};
 use crate::services::{self, Resolver, Service};
 
+/// Always-skipped directories, even when not gitignored (e.g. a checkout
+/// without a .gitignore, or one that commits its lockfile but not its rules).
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -26,6 +30,11 @@ const SKIP_DIRS: &[&str] = &[
     ".mypy_cache",
     ".pytest_cache",
 ];
+
+/// Files larger than this are skipped: hand-written source essentially never
+/// reaches 1 MiB, while generated bundles and minified JS routinely do — and
+/// they'd pollute every `find` with noise.
+const MAX_FILE_SIZE: u64 = 1024 * 1024;
 
 struct Candidate {
     rel: String,
@@ -77,9 +86,24 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
     }
 
     let now = epoch_secs();
-    let mut seen: HashSet<String> = HashSet::new();
     let mut indexed = 0usize;
     let mut skipped = 0usize;
+    let seen: HashSet<&str> = candidates.iter().map(|c| c.rel.as_str()).collect();
+
+    // Snapshot the stored per-file stats up front so change detection and
+    // extraction can run off the database thread.
+    let stored: HashMap<String, StoredFile> = if incremental {
+        let mut stmt = conn.prepare("SELECT path, git_hash, mtime, size FROM files")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                StoredFile { hash: r.get(1)?, mtime: r.get(2)?, size: r.get(3)? },
+            ))
+        })?;
+        rows.filter_map(|r| r.ok()).collect()
+    } else {
+        HashMap::new()
+    };
 
     // Determinate bar over the scanned candidates. indicatif draws to stderr
     // and hides itself when stderr is not a TTY, so piped/scripted runs stay
@@ -91,62 +115,45 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
             .progress_chars("=>-"),
     );
 
-    let tx = conn.transaction()?;
-    for c in &candidates {
-        bar.inc(1);
-        bar.set_message(c.rel.clone());
-        seen.insert(c.rel.clone());
-        let abs = root.join(&c.rel);
-        let (mtime, size) = stat(&abs);
+    // Read + hash + parse + extract in parallel (parsing dominates a full
+    // index and is embarrassingly parallel). Collected in candidate order so
+    // symbol ids stay deterministic; only the writer below touches SQLite.
+    let outcomes: Vec<Outcome> = candidates
+        .par_iter()
+        .map(|c| {
+            let out = examine(root, c, stored.get(&c.rel));
+            bar.inc(1);
+            bar.set_message(c.rel.clone());
+            out
+        })
+        .collect();
 
-        if incremental {
-            let stored: Option<(String, i64, i64)> = tx
-                .query_row(
-                    "SELECT git_hash, mtime, size FROM files WHERE path = ?1",
-                    [&c.rel],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .ok();
-            if let Some((stored_hash, stored_mtime, stored_size)) = stored {
-                // Fast path: an untouched stat means an unchanged file — skip
-                // without even reading it.
-                if mtime == stored_mtime && size == stored_size && mtime != 0 {
-                    skipped += 1;
-                    continue;
+    let tx = conn.transaction()?;
+    for (c, outcome) in candidates.iter().zip(outcomes) {
+        match outcome {
+            Outcome::Unchanged => skipped += 1,
+            // Same content, moved stat (e.g. touch, checkout): refresh the
+            // stat so the next run takes the fast path again.
+            Outcome::Touched { mtime, size } => {
+                tx.execute(
+                    "UPDATE files SET mtime = ?1, size = ?2 WHERE path = ?3",
+                    rusqlite::params![mtime, size, c.rel],
+                )?;
+                skipped += 1;
+            }
+            Outcome::Unreadable => {}
+            Outcome::Index { existed, loc, hash, mtime, size, extracted } => {
+                if existed {
+                    // Clear the file's prior rows (cascades symbols/edges).
+                    tx.execute("DELETE FROM files WHERE path = ?1", [&c.rel])?;
                 }
-                // Stat moved (e.g. touch, checkout): confirm via content hash.
-                let bytes = match std::fs::read(&abs) {
-                    Ok(b) => b,
-                    Err(_) => continue,
-                };
-                let hash = git::blob_hash(&bytes);
-                if hash == stored_hash {
-                    tx.execute(
-                        "UPDATE files SET mtime = ?1, size = ?2 WHERE path = ?3",
-                        rusqlite::params![mtime, size, c.rel],
-                    )?;
-                    skipped += 1;
-                    continue;
-                }
-                // Changed file: clear its prior rows (cascades symbols/edges).
-                tx.execute("DELETE FROM files WHERE path = ?1", [&c.rel])?;
-                let src = String::from_utf8_lossy(&bytes);
                 let service = resolver.resolve(&c.rel);
-                index_file(&tx, &c.rel, c.lang, service, &src, &hash, mtime, size, now)?;
+                write_file(
+                    &tx, &c.rel, c.lang, service, loc, &extracted?, &hash, mtime, size, now,
+                )?;
                 indexed += 1;
-                continue;
             }
         }
-
-        let bytes = match std::fs::read(&abs) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let hash = git::blob_hash(&bytes);
-        let src = String::from_utf8_lossy(&bytes);
-        let service = resolver.resolve(&c.rel);
-        index_file(&tx, &c.rel, c.lang, service, &src, &hash, mtime, size, now)?;
-        indexed += 1;
     }
 
     // Purge files that vanished from disk (incremental run only; full reindex
@@ -157,7 +164,7 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
             let mut stmt = tx.prepare("SELECT path FROM files")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
             rows.filter_map(|r| r.ok())
-                .filter(|p| !seen.contains(p))
+                .filter(|p| !seen.contains(p.as_str()))
                 .collect()
         };
         for p in &stale {
@@ -214,22 +221,41 @@ fn services_fingerprint(resolver: &Resolver) -> String {
 }
 
 /// Walk the repo collecting indexable files (repo-relative paths).
+///
+/// The walk honors `.gitignore`/`.ignore` rules (`require_git(false)` so an
+/// exported tree without `.git` behaves the same as the checkout it came
+/// from), but not the machine-local global gitignore — what gets indexed must
+/// not depend on whose machine ran it. `SKIP_DIRS` stays as a fallback for
+/// dependency/cache directories in repos with no ignore rules, and oversized
+/// files (generated bundles, minified JS) are dropped. Entries are sorted so
+/// symbol-id assignment — and therefore edge-resolution tie-breaks — is
+/// deterministic across runs.
 fn scan(root: &Path, db_file: &Path) -> Vec<Candidate> {
     let mut out = Vec::new();
-    let walker = WalkDir::new(root).into_iter().filter_entry(|e| {
-        if e.file_type().is_dir() {
-            let name = e.file_name().to_string_lossy();
-            !SKIP_DIRS.contains(&name.as_ref())
-        } else {
-            true
-        }
-    });
-    for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .hidden(false) // dot-dirs may hold real code; SKIP_DIRS covers the noisy ones
+        .require_git(false)
+        .git_global(false)
+        .follow_links(false)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            if e.file_type().is_some_and(|t| t.is_dir()) {
+                let name = e.file_name().to_string_lossy();
+                !SKIP_DIRS.contains(&name.as_ref())
+            } else {
+                true
+            }
+        });
+    for entry in builder.build().filter_map(|e| e.ok()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let path = entry.path();
         if path == db_file {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len() > MAX_FILE_SIZE).unwrap_or(false) {
             continue;
         }
         if let Some(lang) = Language::from_path(path) {
@@ -291,13 +317,77 @@ fn write_services(conn: &Connection, resolver: &Resolver) -> Result<()> {
     Ok(())
 }
 
+/// The stored change-detection stats for one indexed file.
+struct StoredFile {
+    hash: String,
+    mtime: i64,
+    size: i64,
+}
+
+/// What the parallel examine pass decided for one candidate; the serial
+/// writer turns these into database rows.
+enum Outcome {
+    /// Untouched stat — skipped without even reading the file.
+    Unchanged,
+    /// Stat moved but content hash matched: just refresh the stored stat.
+    Touched { mtime: i64, size: i64 },
+    /// The file vanished or can't be read; leave it alone (a deletion is
+    /// handled by the stale-purge pass).
+    Unreadable,
+    /// Parse + extraction ran; `existed` means prior rows must be cleared.
+    Index {
+        existed: bool,
+        loc: i64,
+        hash: String,
+        mtime: i64,
+        size: i64,
+        extracted: anyhow::Result<Extracted>,
+    },
+}
+
+/// Change-detect one candidate and, when it changed (or is new), parse and
+/// extract it. Pure with respect to the database — safe to run in parallel.
+fn examine(root: &Path, c: &Candidate, stored: Option<&StoredFile>) -> Outcome {
+    let abs = root.join(&c.rel);
+    let (mtime, size) = stat(&abs);
+
+    if let Some(f) = stored {
+        // Fast path: an untouched stat means an unchanged file — skip
+        // without even reading it.
+        if mtime == f.mtime && size == f.size && mtime != 0 {
+            return Outcome::Unchanged;
+        }
+    }
+    let bytes = match std::fs::read(&abs) {
+        Ok(b) => b,
+        Err(_) => return Outcome::Unreadable,
+    };
+    let hash = git::blob_hash(&bytes);
+    if let Some(f) = stored {
+        // Stat moved (e.g. touch, checkout): confirm via content hash.
+        if hash == f.hash {
+            return Outcome::Touched { mtime, size };
+        }
+    }
+    let src = String::from_utf8_lossy(&bytes);
+    Outcome::Index {
+        existed: stored.is_some(),
+        loc: git::loc(&src) as i64,
+        hash,
+        mtime,
+        size,
+        extracted: c.lang.extract(&src),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn index_file(
+fn write_file(
     tx: &rusqlite::Transaction,
     rel: &str,
     lang: Language,
     service: &Service,
-    src: &str,
+    loc: i64,
+    extracted: &Extracted,
     hash: &str,
     mtime: i64,
     size: i64,
@@ -306,19 +396,8 @@ fn index_file(
     tx.execute(
         "INSERT INTO files(path, service, language, loc, git_hash, mtime, size, indexed_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![
-            rel,
-            service.name,
-            lang.name(),
-            git::loc(src) as i64,
-            hash,
-            mtime,
-            size,
-            now
-        ],
+        rusqlite::params![rel, service.name, lang.name(), loc, hash, mtime, size, now],
     )?;
-
-    let extracted = lang.extract(src)?;
 
     // Insert symbols, remembering (id, start, end) for enclosing resolution.
     let mut spans: Vec<(i64, usize, usize)> = Vec::with_capacity(extracted.symbols.len());
@@ -761,6 +840,59 @@ mod tests {
             .unwrap();
         let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!((s.files_indexed, s.files_skipped), (0, 1));
+    }
+
+    #[test]
+    fn gitignored_files_are_not_indexed() {
+        let (conn, _dir) = index_repo(&[
+            (".gitignore", "gen/\nskipme.rs\n"),
+            ("svc/a.rs", "pub fn kept() {}\n"),
+            ("svc/skipme.rs", "pub fn ignored_by_name() {}\n"),
+            ("gen/b.rs", "pub fn generated() {}\n"),
+        ]);
+        assert!(symbol_exists(&conn, "kept"));
+        assert!(!symbol_exists(&conn, "generated"), "gitignored dir is skipped");
+        assert!(!symbol_exists(&conn, "ignored_by_name"), "gitignored file is skipped");
+    }
+
+    #[test]
+    fn newly_gitignored_files_are_purged_on_the_next_run() {
+        // The ignored path sits *inside* a service that keeps other files, so
+        // the inferred service set — and thus the incremental mode — survives.
+        let dir = build_repo(&[
+            ("svc/a.rs", "pub fn kept() {}\n"),
+            ("svc/gen/b.rs", "pub fn generated() {}\n"),
+        ]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+        assert!(symbol_exists(&conn, "generated"));
+
+        std::fs::write(dir.path().join(".gitignore"), "svc/gen/\n").unwrap();
+        let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
+        assert_eq!(s.mode, "incremental");
+        assert_eq!(s.files_removed, 1);
+        assert!(!symbol_exists(&conn, "generated"), "now-ignored file's symbols are gone");
+        assert!(symbol_exists(&conn, "kept"));
+    }
+
+    #[test]
+    fn skip_dirs_still_apply_without_any_ignore_rules() {
+        let (conn, _dir) = index_repo(&[
+            ("svc/a.rs", "pub fn kept() {}\n"),
+            ("node_modules/dep/x.ts", "export function vendored() {}\n"),
+        ]);
+        assert!(symbol_exists(&conn, "kept"));
+        assert!(!symbol_exists(&conn, "vendored"));
+    }
+
+    #[test]
+    fn oversized_files_are_skipped() {
+        let mut big = String::from("pub fn huge() {}\n");
+        big.push_str(&"// padding padding padding\n".repeat(50_000)); // > 1 MiB
+        let (conn, _dir) =
+            index_repo(&[("svc/a.rs", "pub fn small() {}\n"), ("svc/big.rs", big.as_str())]);
+        assert!(symbol_exists(&conn, "small"));
+        assert!(!symbol_exists(&conn, "huge"), "files over the size cap are not indexed");
     }
 
     #[test]

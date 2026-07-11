@@ -2,7 +2,15 @@
 //! capture-name conventions (see queries/*.scm). Adding a language never
 //! requires changing this file — only a new `lang/<x>.rs` + `queries/<x>.scm`.
 
+use std::cell::RefCell;
+
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
+
+thread_local! {
+    // One reusable parser per thread: `Parser::new` allocates, while
+    // `set_language` is cheap enough to call once per file.
+    static PARSER: RefCell<Parser> = RefCell::new(Parser::new());
+}
 
 /// A definition site discovered in a file. Lines are 1-based.
 pub struct RawSymbol {
@@ -28,20 +36,22 @@ pub struct Extracted {
     pub edges: Vec<RawEdge>,
 }
 
-/// Parse `src` with `language` and run `query_src`, interpreting captures by
-/// name. A capture `def.<kind>` plus a `name` capture yields a symbol; the
-/// `call.name` / `extends.name` captures and any `import.*` capture yield edges.
+/// Parse `src` with `language` and run the pre-compiled `query`, interpreting
+/// captures by name. A capture `def.<kind>` plus a `name` capture yields a
+/// symbol; the `call.name` / `extends.name` captures and any `import.*`
+/// capture yield edges.
 pub fn extract(
     src: &str,
     language: &tree_sitter::Language,
-    query_src: &str,
+    query: &Query,
 ) -> anyhow::Result<Extracted> {
-    let mut parser = Parser::new();
-    parser.set_language(language)?;
-    let tree = parser
-        .parse(src, None)
-        .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
-    let query = Query::new(language, query_src)?;
+    let tree = PARSER.with(|p| -> anyhow::Result<_> {
+        let mut parser = p.borrow_mut();
+        parser.set_language(language)?;
+        parser
+            .parse(src, None)
+            .ok_or_else(|| anyhow::anyhow!("parse failed"))
+    })?;
     let names = query.capture_names();
     let bytes = src.as_bytes();
 
@@ -49,7 +59,7 @@ pub fn extract(
     let mut edges = Vec::new();
 
     let mut cursor = QueryCursor::new();
-    let mut it = cursor.matches(&query, tree.root_node(), bytes);
+    let mut it = cursor.matches(query, tree.root_node(), bytes);
     while let Some(m) = it.next() {
         // Locate the relevant nodes within this match by capture name.
         let mut def_node: Option<(Node, &str)> = None; // (whole def, kind)
