@@ -470,23 +470,47 @@ fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
 /// * Within a service, a definition in the **same file** wins, then lowest id.
 /// * **Self-edges are excluded** so a symbol is never its own caller (e.g. a
 ///   recursive call, or a method whose body references its own name).
+///
+/// The preference order is expressed as a COALESCE of three short-circuiting
+/// tiers (same file → same service → imported, any service) instead of one
+/// `ORDER BY` over the whole `OR`-ed candidate set. Each tier is an exact
+/// index-range probe whose entries are already in id order, so `ORDER BY id
+/// LIMIT 1` reads a row or two — where the old single query walked (and
+/// sorted) *every* same-named symbol per reference, which degenerated badly
+/// on repos where the same name repeats across many files.
 fn resolve_edges(tx: &rusqlite::Transaction) -> Result<()> {
     tx.execute("DELETE FROM edges", [])?;
     tx.execute(
         "INSERT INTO edges(src_symbol, dst_symbol, kind)
-         SELECT er.src_symbol, d.id, er.kind
-         FROM edge_raw er
-         JOIN symbols src ON src.id = er.src_symbol
-         JOIN symbols d ON d.id = (
-             SELECT s.id FROM symbols s
-             WHERE s.name = er.dst_name
-               AND s.id <> er.src_symbol
-               AND (s.service = src.service
-                    OR EXISTS (SELECT 1 FROM file_imports fi
-                               WHERE fi.file = src.file AND fi.name = er.dst_name))
-             ORDER BY (s.file = src.file) DESC, (s.service = src.service) DESC, s.id
-             LIMIT 1
-         )",
+         SELECT src_symbol, dst, kind FROM (
+             SELECT er.src_symbol AS src_symbol, er.kind AS kind,
+                    COALESCE(
+                        -- Same file (always same service), lowest id.
+                        (SELECT s.id FROM symbols s
+                          WHERE s.file = src.file AND s.name = er.dst_name
+                            AND s.id <> er.src_symbol
+                          ORDER BY s.id LIMIT 1),
+                        -- Same service, lowest id.
+                        (SELECT s.id FROM symbols s
+                          WHERE s.name = er.dst_name AND s.service = src.service
+                            AND s.id <> er.src_symbol
+                          ORDER BY s.id LIMIT 1),
+                        -- Imported names may cross services. The CASE gates
+                        -- the candidate scan on the (indexed) import lookup,
+                        -- so unimported unresolvable names cost one probe.
+                        (CASE WHEN EXISTS (SELECT 1 FROM file_imports fi
+                                            WHERE fi.file = src.file
+                                              AND fi.name = er.dst_name)
+                              THEN (SELECT s.id FROM symbols s
+                                     WHERE s.name = er.dst_name
+                                       AND s.id <> er.src_symbol
+                                     ORDER BY s.id LIMIT 1)
+                         END)
+                    ) AS dst
+             FROM edge_raw er
+             JOIN symbols src ON src.id = er.src_symbol
+         )
+         WHERE dst IS NOT NULL",
         [],
     )?;
     Ok(())
@@ -660,6 +684,18 @@ mod tests {
             !edge_exists(&conn, "fib", "fib"),
             "a symbol must not be its own caller"
         );
+    }
+
+    #[test]
+    fn recursive_call_falls_back_to_another_same_name_definition() {
+        // Self is excluded per tier, not just once: with no other same-file
+        // candidate, the recursive reference resolves to the same-service
+        // definition in the other file.
+        let (conn, _dir) = index_repo(&[
+            ("svc/a.rs", "pub fn fib() { fib(); }\n"),
+            ("svc/b.rs", "pub fn fib() {}\n"),
+        ]);
+        assert_eq!(dst_file_of(&conn, "fib").as_deref(), Some("svc/b.rs"));
     }
 
     #[test]

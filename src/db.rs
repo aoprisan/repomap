@@ -6,7 +6,7 @@ use rusqlite::Connection;
 /// Bumped whenever the schema changes shape. The index is derived data — a
 /// cache over the working tree — so migration is simply "drop and let the
 /// next (auto-)index rebuild", never an ALTER dance.
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -73,8 +73,13 @@ CREATE TABLE IF NOT EXISTS symbols (
   service        TEXT NOT NULL,
   language       TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_sym_name ON symbols(name);
-CREATE INDEX IF NOT EXISTS idx_sym_file ON symbols(file);
+-- Composite indexes sized for edge resolution: each resolver tier is an
+-- exact-range probe (name+service / file+name) whose entries are already in
+-- id order, so `ORDER BY id LIMIT 1` stops after a row or two. Name-only and
+-- file-only lookups (def, outline, enclosing) use the same indexes as
+-- prefixes.
+CREATE INDEX IF NOT EXISTS idx_sym_name_service ON symbols(name, service);
+CREATE INDEX IF NOT EXISTS idx_sym_file_name ON symbols(file, name);
 
 -- Best-effort references keyed by dst *name*; resolved into `edges` after
 -- each index run. Cascades away when its source symbol (and file) is dropped.
