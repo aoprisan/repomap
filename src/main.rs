@@ -1,6 +1,9 @@
 mod cli;
+mod context;
 mod db;
 mod git;
+mod graph;
+mod history;
 mod index;
 mod install;
 mod lang;
@@ -106,6 +109,10 @@ fn main() -> Result<()> {
         Cmd::Callers { symbol } => query::callers(&conn, &symbol)?,
         Cmd::Callees { symbol } => query::callees(&conn, &symbol)?,
         Cmd::Outline { file } => query::outline(&conn, &file)?,
+        Cmd::Rank { service, k } => query::rank(&conn, service.as_deref(), k)?,
+        Cmd::Impact { symbol, depth, k } => query::impact(&conn, &symbol, depth, k)?,
+        Cmd::Cochange { file, commits, k } => history::cochange(&conn, &root, &file, commits, k)?,
+        Cmd::Context { query, budget } => context::context(&conn, &query, budget)?,
     }
     Ok(())
 }

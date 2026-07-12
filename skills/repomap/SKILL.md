@@ -1,6 +1,6 @@
 ---
 name: repomap
-description: Navigate a polyglot codebase fast using the `repomap` CLI — a compact code index (file:line + signature + service, never code bodies). Use BEFORE grepping or reading files broadly to locate a symbol's definition, find who calls it, search symbols by name, or get a high-level map of services. Trigger phrases include "where is X defined", "who calls X", "find the X function/class", "what services are in this repo", "map the codebase", "navigate the code".
+description: Navigate a polyglot codebase fast using the `repomap` CLI — a compact code index (file:line + signature + service, never code bodies). Use BEFORE grepping or reading files broadly to locate a symbol's definition, find who calls it, search symbols by name, get a high-level map of services, see the most important symbols, measure the blast radius of a change, or find files that historically change together. Trigger phrases include "where is X defined", "who calls X", "find the X function/class", "what services are in this repo", "map the codebase", "what breaks if I change X", "what else do I need to update", "what's important in this repo", "orient me on this task".
 ---
 
 # repomap
@@ -107,15 +107,68 @@ repomap outline src/query.rs
 repomap outline Invoice.scala
 ```
 
+### `repomap rank [--service S] [-k N]`
+The most structurally important symbols, by PageRank over the reference graph
+(score 100 = top symbol in scope; caller count shown alongside). The fastest
+way to learn what an unfamiliar repo actually revolves around — run it before
+diving in, or per `--service` to orient inside one service.
+
+```sh
+repomap rank -k 10
+repomap rank --service billing
+```
+
+### `repomap impact <symbol> [--depth N] [-k N]`
+Transitive blast radius: callers, callers-of-callers, … up to `--depth` hops
+(default 2), each tagged `(depth d)`, nearest first, with a closing summary of
+symbols/files/services touched. Run this **before changing a shared symbol**
+to know what could break and how far the change ripples.
+
+```sh
+repomap impact resolve_edges
+repomap impact get --depth 3
+```
+
+### `repomap cochange <file> [-k N]`
+Files that historically change **in the same commit** as `<file>` (mined from
+git history), with co-change counts and confidence. This surfaces coupling no
+static analysis sees — schema + DAO, config + reader, mirrored types. Run it
+after deciding to edit a file and **check whether the top partners also need
+your change**. Accepts a path suffix; also works for unindexed files (`.sql`,
+`.yml`, …).
+
+```sh
+repomap cochange src/query.rs
+repomap cochange schema.sql -k 5
+```
+
+### `repomap context <query> [--budget N]`
+A one-shot orientation pack for a task: seed symbols matching `<query>`
+(any-word match), each with its top callers (`<-`) and callees (`->`), plus
+the services involved, packed to fit `--budget` tokens (default 2000). Use it
+as the **first command for a new task** instead of stitching together find /
+def / callers / callees; the footer says how much budget was used and whether
+seeds were cut.
+
+```sh
+repomap context "invoice tax rounding"
+repomap context "index refresh" --budget 800
+```
+
 ## Typical workflow
 
-1. `repomap map` — see the services and stacks at a glance.
+1. `repomap context "<task words>"` — one-shot orientation: seeds + neighbors
+   + services for the task at hand. (Or `repomap map` + `repomap rank` to
+   orient in the repo as a whole.)
 2. `repomap find <name>` — locate candidate symbols by fuzzy name.
 3. `repomap def <name>` — pin the exact definition site(s).
 4. `repomap callers <name>` / `repomap callees <name>` — see who depends on it
    and what it depends on before changing it.
-5. `repomap outline <file>` — map a file's shape before opening or editing it.
-6. Open the reported `path:Lstart` to read the real code.
+5. `repomap impact <name>` — blast radius before you change something shared.
+6. `repomap outline <file>` — map a file's shape before opening or editing it.
+7. `repomap cochange <file>` — files that historically change with the one
+   you're editing; check whether they need the same change.
+8. Open the reported `path:Lstart` to read the real code.
 
 ## Notes
 

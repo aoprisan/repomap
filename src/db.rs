@@ -6,7 +6,7 @@ use rusqlite::Connection;
 /// Bumped whenever the schema changes shape. The index is derived data — a
 /// cache over the working tree — so migration is simply "drop and let the
 /// next (auto-)index rebuild", never an ALTER dance.
-const SCHEMA_VERSION: i32 = 3;
+const SCHEMA_VERSION: i32 = 4;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -71,7 +71,11 @@ CREATE TABLE IF NOT EXISTS symbols (
   signature      TEXT,
   doc_first_line TEXT,
   service        TEXT NOT NULL,
-  language       TEXT NOT NULL
+  language       TEXT NOT NULL,
+  -- PageRank over the resolved edge graph, recomputed on every index run.
+  -- Importance flows along references: a symbol used by important symbols is
+  -- important. Ranks sum to ~1 across the repo; 0 until the first compute.
+  rank           REAL NOT NULL DEFAULT 0
 );
 -- Composite indexes sized for edge resolution: each resolver tier is an
 -- exact-range probe (name+service / file+name) whose entries are already in

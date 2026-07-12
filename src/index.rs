@@ -175,6 +175,8 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
 
     bar.set_message("resolving edges…");
     resolve_edges(&tx)?;
+    // Edges were just rebuilt from scratch, so recompute importance to match.
+    crate::graph::compute_ranks(&tx)?;
 
     // The synthetic catch-all only earns a row if a file actually landed in
     // it; otherwise drop it so `map` shows only real services.
