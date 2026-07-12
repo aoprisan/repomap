@@ -75,4 +75,40 @@ pub enum Cmd {
     /// All symbols defined in <file> (exact repo-relative path, or a path
     /// suffix like `Invoice.scala`), in source order.
     Outline { file: String },
+    /// Most important symbols by PageRank over the reference graph
+    /// (score 100 = top symbol in scope). Orient in an unfamiliar codebase.
+    Rank {
+        #[arg(long)]
+        service: Option<String>,
+        #[arg(short = 'k', default_value_t = 20)]
+        k: usize,
+    },
+    /// Blast radius of changing <symbol>: transitive callers up to --depth
+    /// hops, nearest and most important first.
+    Impact {
+        symbol: String,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(short = 'k', default_value_t = 40)]
+        k: usize,
+    },
+    /// Files that historically change in the same commit as <file> (exact
+    /// repo-relative path, or a suffix), from git history.
+    Cochange {
+        file: String,
+        /// How many recent commits to mine.
+        #[arg(long, default_value_t = 1000)]
+        commits: usize,
+        #[arg(short = 'k', default_value_t = 10)]
+        k: usize,
+    },
+    /// One-shot orientation pack for a task: seed symbols matching <query>,
+    /// their callers/callees, and the services involved — packed to fit a
+    /// token budget.
+    Context {
+        query: String,
+        /// Approximate token budget for the pack.
+        #[arg(long, default_value_t = 2000)]
+        budget: usize,
+    },
 }

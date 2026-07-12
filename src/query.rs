@@ -49,7 +49,7 @@ fn enclosing_sql(alias: &str) -> String {
     ENCLOSING_SQL.replace("s.", &format!("{alias}."))
 }
 
-// SQL fragment for in-degree (incoming edges), the find tie-breaker.
+// SQL fragment for in-degree (incoming edges), shown by `rank`.
 const INDEG_SQL: &str = "(SELECT count(*) FROM edges WHERE dst_symbol = s.id)";
 
 fn row_to_pointer(
@@ -106,8 +106,10 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
         params.push(Box::new(v.clone()));
         sql.push_str(&format!(" AND s.language = ?{}", params.len()));
     }
+    // Ties in text relevance break toward graph importance (PageRank), so the
+    // symbol the repo actually leans on surfaces before same-named helpers.
     sql.push_str(&format!(
-        " ORDER BY bm25(symbols_fts), {INDEG_SQL} DESC LIMIT {}",
+        " ORDER BY bm25(symbols_fts), s.rank DESC LIMIT {}",
         opts.k
     ));
 
@@ -133,7 +135,7 @@ pub fn def(conn: &Connection, symbol: &str) -> Result<()> {
                 {ENCLOSING_SQL}
          FROM symbols s
          WHERE s.name = ?1
-         ORDER BY {INDEG_SQL} DESC, s.file, s.start_line"
+         ORDER BY s.rank DESC, s.file, s.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([symbol], |r| {
@@ -212,6 +214,107 @@ pub fn callees(conn: &Connection, symbol: &str) -> Result<()> {
     if !any {
         eprintln!("no callees for '{symbol}'");
     }
+    Ok(())
+}
+
+/// Structurally most important symbols, by PageRank over the reference graph.
+/// The score is normalized so the top symbol in scope is 100 — comparable
+/// within one invocation, not across repos. Orientation: run this (optionally
+/// per service) to learn what a codebase actually revolves around.
+pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<()> {
+    let mut sql = format!(
+        "SELECT s.file, s.start_line, s.signature,
+                {ENCLOSING_SQL}, s.rank, {INDEG_SQL}
+         FROM symbols s"
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(v) = service {
+        params.push(Box::new(v.to_string()));
+        sql.push_str(" WHERE s.service = ?1");
+    }
+    sql.push_str(&format!(" ORDER BY s.rank DESC, s.file, s.start_line LIMIT {k}"));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+    let rows = stmt.query_map(pref.as_slice(), |r| {
+        Ok((
+            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
+            r.get::<_, f64>(4)?,
+            r.get::<_, i64>(5)?,
+        ))
+    })?;
+    let results: Vec<(Pointer, f64, i64)> = rows.filter_map(|r| r.ok()).collect();
+    let max = results.iter().map(|(_, r, _)| *r).fold(0.0f64, f64::max);
+    if results.is_empty() || max <= 0.0 {
+        eprintln!("no ranked symbols (index empty, or no references resolved yet)");
+        return Ok(());
+    }
+    for (p, r, indeg) in &results {
+        let score = r / max * 100.0;
+        let callers = if *indeg == 1 { "1 caller".into() } else { format!("{indeg} callers") };
+        p.print(&format!("  (score {score:.0}, {callers})"));
+    }
+    Ok(())
+}
+
+/// Transitive blast radius of changing `symbol`: its callers, their callers,
+/// and so on up to `depth` hops, most important first within each hop.
+pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result<()> {
+    let reached = crate::graph::impact(conn, symbol, depth)?;
+    if reached.is_empty() {
+        let defined: i64 = conn.query_row(
+            "SELECT count(*) FROM symbols WHERE name = ?1",
+            [symbol],
+            |r| r.get(0),
+        )?;
+        if defined == 0 {
+            eprintln!("no definition for '{symbol}'");
+        } else {
+            eprintln!("no impact: nothing references '{symbol}'");
+        }
+        return Ok(());
+    }
+
+    // Pull pointer rows for every reached symbol, then order by (depth, rank
+    // desc): nearest and most load-bearing dependents first.
+    let sql = format!(
+        "SELECT s.file, s.start_line, s.signature, {ENCLOSING_SQL}, s.rank, s.service
+         FROM symbols s WHERE s.id = ?1"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows: Vec<(Pointer, usize, f64, String)> = Vec::with_capacity(reached.len());
+    for r in &reached {
+        let (p, rank, service) = stmt.query_row([r.id], |row| {
+            Ok((
+                row_to_pointer(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        rows.push((p, r.depth, rank, service));
+    }
+    rows.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| (a.0.file.as_str(), a.0.start_line).cmp(&(b.0.file.as_str(), b.0.start_line)))
+    });
+
+    let files: std::collections::HashSet<&str> =
+        rows.iter().map(|(p, ..)| p.file.as_str()).collect();
+    let services: std::collections::HashSet<&str> =
+        rows.iter().map(|(.., s)| s.as_str()).collect();
+    let total = rows.len();
+    for (p, d, ..) in rows.iter().take(k) {
+        p.print(&format!("  (depth {d})"));
+    }
+    if total > k {
+        println!("… and {} more (raise -k)", total - k);
+    }
+    println!(
+        "impact: {total} symbols in {} files across {} services (depth ≤ {depth})",
+        files.len(),
+        services.len()
+    );
     Ok(())
 }
 
@@ -323,7 +426,18 @@ pub fn clear_db(path: &str) -> Result<()> {
 
 /// Turn free text into a tolerant FTS5 prefix query: each bareword becomes a
 /// prefix term so `find handle` matches `handleRequest`.
-fn fts_query(q: &str) -> String {
+pub(crate) fn fts_query(q: &str) -> String {
+    fts_terms(q).join(" ")
+}
+
+/// Like `fts_query`, but any-term (OR) semantics: made for task-shaped free
+/// text ("edge resolution refresh") where demanding every word kills recall —
+/// bm25 still ranks fuller matches first.
+pub(crate) fn fts_query_any(q: &str) -> String {
+    fts_terms(q).join(" OR ")
+}
+
+fn fts_terms(q: &str) -> Vec<String> {
     let terms: Vec<String> = q
         .split_whitespace()
         .map(|t| {
@@ -338,9 +452,9 @@ fn fts_query(q: &str) -> String {
         .collect();
     if terms.is_empty() {
         // Fall back to a never-matching token rather than invalid syntax.
-        "\"\"".to_string()
+        vec!["\"\"".to_string()]
     } else {
-        terms.join(" ")
+        terms
     }
 }
 
@@ -399,6 +513,13 @@ mod tests {
         assert_eq!(fts_query("   "), "\"\"");
         // FTS5 boolean keywords are quoted to literals, not operators.
         assert_eq!(fts_query("a OR b"), "\"a\"* \"OR\"* \"b\"*");
+    }
+
+    #[test]
+    fn fts_query_any_ors_terms_for_task_shaped_text() {
+        assert_eq!(fts_query_any("edge resolution"), "\"edge\"* OR \"resolution\"*");
+        assert_eq!(fts_query_any("one"), "\"one\"*");
+        assert_eq!(fts_query_any(""), "\"\"");
     }
 
     #[test]

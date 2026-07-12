@@ -69,8 +69,12 @@ callers, and map services instead of broad file reads.
 
 ```sh
 cd your-monorepo
-repomap map          # list services
-repomap find Invoice # search symbols
+repomap map                    # list services
+repomap find Invoice           # search symbols
+repomap rank                   # most important symbols (PageRank)
+repomap impact InvoiceService  # blast radius of changing a symbol
+repomap cochange billing.rs    # files that historically change with it
+repomap context "tax rounding" # token-budgeted orientation pack for a task
 ```
 
 No setup step: **query commands refresh the index automatically** before
@@ -221,6 +225,89 @@ fixtures/billing/src/main/scala/billing/Invoice.scala:L14  object InvoiceService
 fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
 ```
 
+### `rank [--service S] [-k N]`
+
+The structurally most important symbols, by **PageRank over the reference
+graph** — a symbol used by important symbols is important, which raw caller
+counts can't express. Scores are normalized so the top symbol in scope is 100.
+Every index run recomputes ranks, and `find`/`def` use them to break ties, so
+the definition a repo actually leans on surfaces before same-named helpers.
+
+Run it (optionally per `--service`) to learn what a codebase revolves around
+before reading anything:
+
+```
+$ repomap rank -k 3
+src/services.rs:L76  pub fn new(mut services: Vec<Service>) -> Self  [Resolver]  (score 100, 41 callers)
+src/lang/mod.rs:L75  fn get(cell: &'static OnceLock<Query>, ...) -> &'static Query  [compiled_query]  (score 69, 69 callers)
+src/query.rs:L350  pub fn map(conn: &Connection) -> Result<()>  [-]  (score 32, 31 callers)
+```
+
+(Note the second line: more callers, lower score — *who* references you
+matters, not just how many.)
+
+### `impact <symbol> [--depth N] [-k N]`
+
+The transitive blast radius of changing `<symbol>`: its callers, their
+callers, and so on up to `--depth` hops (default 2), each line tagged with its
+distance, nearest and most important first, with a closing summary. Run it
+**before** modifying a shared symbol to see what could break:
+
+```
+$ repomap impact resolve_edges
+src/index.rs:L56  pub fn run(...) -> Result<Summary>  [-]  (depth 1)
+src/index.rs:L541  pub fn refresh(...) -> Result<()>  [-]  (depth 2)
+src/main.rs:L21  fn main() -> Result<()>  [-]  (depth 2)
+impact: 9 symbols in 2 files across 1 services (depth ≤ 2)
+```
+
+### `cochange <file> [--commits N] [-k N]`
+
+Files that **historically change in the same commit** as `<file>`, mined from
+the last `--commits` (default 1000) non-merge commits. This is coupling no
+static analysis can see — a schema file and its DAO, a config and the code
+reading it, mirrored client/server types — and exactly the "when you edit X,
+don't forget Y" signal to check before a change. Bulk commits (>30 files:
+mass renames, format sweeps) are skipped as noise, and partners deleted from
+the working tree are dropped. `<file>` is an exact repo-relative path or an
+unambiguous suffix; unindexed files (`.sql`, `.yml`, …) work too when the
+path exists on disk.
+
+```
+$ repomap cochange src/query.rs
+src/cli.rs  5/7 commits (71%)
+src/main.rs  5/7 commits (71%)
+README.md  4/7 commits (57%)
+```
+
+Requires `git` on PATH and commit history; without either it explains itself
+instead of answering.
+
+### `context <query> [--budget N]`
+
+A one-shot, token-budgeted **orientation pack** for a task: seed symbols
+matching `<query>` (any-word match, fullest matches first), each with its most
+important callers (`<-`) and callees (`->`), plus the services involved —
+packed greedily to fit `--budget` tokens (default 2000, estimated at ~4
+chars/token). One command replaces the find → def → callers → callees dance
+when starting work, and the output is still pointers-only, sized for pasting
+straight into an agent's context:
+
+```
+$ repomap context "index refresh" --budget 300
+# context: index refresh
+## services
+repomap  (rust)  19 files
+## symbols
+src/index.rs:L541  pub fn refresh(conn: &mut Connection, ...) -> Result<()>
+  <- src/main.rs:L21  main  (call)
+  -> src/index.rs:L56  run  (call)
+[~153 tokens / budget 300; 2/2 seeds]
+```
+
+The footer reports actual usage; when seeds are cut for budget it says so
+(`raise --budget for more`).
+
 ## Services
 
 `repomap` groups files into services. It reads `repomap.toml` at the repo root
@@ -259,6 +346,11 @@ misattributes them to a sibling service.
   when the source file imports the name; same-file preferred, self-edges
   excluded (see the note under `callers`). Imported names are recorded per file
   in `file_imports`, including top-level imports.
+- **Rank** — after edges are resolved, PageRank runs over the symbol graph
+  (damping 0.85, importance flowing along references) and is stored on each
+  symbol; `rank` reads it directly and `find`/`def` use it as a tie-breaker.
+  `impact` BFS-walks the same graph in reverse; `cochange` is independent of
+  the graph — it mines `git log` at query time.
 - **Incremental** — a file is skipped when its stat (mtime + size) is
   untouched, or — when the stat moved — its git blob hash (pure-Rust,
   `git hash-object`-compatible) still matches. Query commands run an
