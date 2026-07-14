@@ -1,6 +1,6 @@
 ---
 name: repomap
-description: Navigate a polyglot codebase fast using the `repomap` CLI — a compact code index (file:line + signature + service, never code bodies). Use BEFORE grepping or reading files broadly to locate a symbol's definition, find who calls it, search symbols by name, get a high-level map of services, see the most important symbols, measure the blast radius of a change, or find files that historically change together. Trigger phrases include "where is X defined", "who calls X", "find the X function/class", "what services are in this repo", "map the codebase", "what breaks if I change X", "what else do I need to update", "what's important in this repo", "orient me on this task".
+description: Navigate and review a polyglot codebase fast using the `repomap` CLI — a compact code index (file:line + signature + service, never code bodies). Use BEFORE grepping or reading files broadly to locate definitions, find callers, map services, measure blast radius, find historically coupled files, or turn a working-tree diff into a semantic review and test plan. Trigger phrases include "where is X defined", "who calls X", "map the codebase", "what breaks if I change X", "what tests should I run", "review my changes", "what else do I need to update", "what's important in this repo", "orient me on this task".
 ---
 
 # repomap
@@ -158,6 +158,22 @@ repomap context "index refresh" --budget 800
 If one result cannot fit, the command reports the minimum required budget
 instead of exceeding the limit.
 
+### `repomap changes [--base REV] [--depth N] [-k N]`
+Analyze the actual working-tree diff before declaring a change finished. It
+classifies symbol additions/deletions/signature/body changes, shows transitive
+callers that deserve review, and selects graph-linked tests. Deleted symbols
+still get a blast radius because repomap retains scoped unresolved references.
+Untracked and non-indexed files are also reported.
+
+```sh
+repomap changes                 # compare working tree with HEAD
+repomap changes --base main     # review the whole branch against main
+repomap changes --depth 4 -k 50
+```
+
+Treat the test list as a high-signal minimum, not proof that no other suite is
+needed. When no graph-linked test is found, run the affected service's suite.
+
 ### `repomap usage [--reset]`
 Shows lifetime query runs, result counts, and the estimated tokens saved by
 using compact pointers. Run `repomap usage --reset` to clear the totals.
@@ -175,7 +191,9 @@ using compact pointers. Run `repomap usage --reset` to clear the totals.
 6. `repomap outline <file>` — map a file's shape before opening or editing it.
 7. `repomap cochange <file>` — files that historically change with the one
    you're editing; check whether they need the same change.
-8. Open the reported `path:Lstart` to read the real code.
+8. `repomap changes` — after editing, review semantic risk and run the linked
+   tests before broad fallback suites.
+9. Open the reported `path:Lstart` to read the real code.
 
 ## Notes
 

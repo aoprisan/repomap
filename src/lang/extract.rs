@@ -20,6 +20,10 @@ pub struct RawSymbol {
     pub end_line: usize,
     pub signature: String,
     pub doc_first_line: Option<String>,
+    /// Language-level evidence that this is a test (annotation/decorator or
+    /// conventional test name). File-path conventions are added by the
+    /// indexer, which has the repo-relative path.
+    pub is_test_hint: bool,
 }
 
 /// A best-effort reference. `src_line` is the line of the reference; the
@@ -81,6 +85,7 @@ pub fn extract(
 
         if let (Some((node, kind)), Some(nn)) = (def_node, name_node) {
             let name = text(nn, bytes).to_string();
+            let is_test_hint = test_hint(node, bytes);
             symbols.push(RawSymbol {
                 name,
                 kind: kind.to_string(),
@@ -88,11 +93,57 @@ pub fn extract(
                 end_line: node.end_position().row + 1,
                 signature: signature_of(node, bytes),
                 doc_first_line: doc_of(node, bytes),
+                is_test_hint,
             });
         }
     }
 
     Ok(Extracted { symbols, edges })
+}
+
+/// Detect common test markers without binding the generic extractor to a
+/// particular test framework. Looking at the definition plus a few preceding
+/// lines covers Rust attributes and Python/Scala decorators; conventional
+/// names cover unittest/pytest and many Rust test suites.
+fn test_hint(node: Node, bytes: &[u8]) -> bool {
+    let has_marker = |s: &str| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("#[test]")
+            || lower.contains("::test]")
+            || lower.contains("@test")
+            || lower.contains("@pytest")
+    };
+    let source = String::from_utf8_lossy(bytes);
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let start = node.start_position().row;
+    // Inspect only the declaration line, never the body: a function that
+    // parses source or test annotations may legitimately contain the literal
+    // string "#[test]" without being a test itself.
+    if lines
+        .get(start)
+        .and_then(|line| line.split('{').next())
+        .is_some_and(has_marker)
+    {
+        return true;
+    }
+    // Fall back to an immediately preceding annotation block. Stop at the
+    // first line of code so a helper following a test cannot inherit the
+    // earlier function's marker.
+    let mut annotations = Vec::new();
+    for line in lines[..start.min(lines.len())].iter().rev().take(5) {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#[") || trimmed.starts_with('@') {
+            annotations.push(trimmed);
+        } else if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        } else {
+            break;
+        }
+    }
+    has_marker(&annotations.join(" "))
 }
 
 fn push_edge(edges: &mut Vec<RawEdge>, node: Node, bytes: &[u8], kind: &str, is_import: bool) {

@@ -442,8 +442,8 @@ fn write_file(
     {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols(name, kind, file, start_line, end_line, signature,
-                                 doc_first_line, service, language)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                 doc_first_line, service, language, is_test)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         for s in &extracted.symbols {
             stmt.execute(rusqlite::params![
@@ -456,6 +456,7 @@ fn write_file(
                 s.doc_first_line,
                 service.name,
                 lang.name(),
+                crate::lang::is_test_symbol(rel, s),
             ])?;
             spans.push((tx.last_insert_rowid(), s.start_line, s.end_line));
         }

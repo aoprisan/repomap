@@ -6,7 +6,7 @@ use rusqlite::Connection;
 /// Bumped whenever the derived-index schema changes shape. The index is a
 /// cache over the working tree, so migration drops and rebuilds those tables;
 /// user-owned lifetime usage data is retained.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -82,6 +82,9 @@ CREATE TABLE IF NOT EXISTS symbols (
   doc_first_line TEXT,
   service        TEXT NOT NULL,
   language       TEXT NOT NULL,
+  -- True for test definitions detected from file conventions, symbol names,
+  -- or language-level test annotations. Used by change-aware test selection.
+  is_test        INTEGER NOT NULL DEFAULT 0,
   -- PageRank over the resolved edge graph, recomputed on every index run.
   -- Importance flows along references: a symbol used by important symbols is
   -- important. Ranks sum to ~1 across the repo; 0 until the first compute.
