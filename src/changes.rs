@@ -13,6 +13,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
+use serde_json::json;
 
 use crate::git;
 use crate::lang::{self, Language, RawSymbol};
@@ -77,6 +78,7 @@ struct Snapshot {
     body_hash: String,
     is_test: bool,
     public: bool,
+    container: Option<String>,
 }
 
 struct ChangedSymbol {
@@ -86,6 +88,7 @@ struct ChangedSymbol {
     line: usize,
     name: Option<String>,
     kind: Option<String>,
+    container: Option<String>,
     signature: String,
     service: String,
     is_test: bool,
@@ -114,7 +117,10 @@ struct Report {
 pub fn run(conn: &Connection, root: &Path, base: &str, depth: usize, k: usize) -> Result<usize> {
     let report = analyze(conn, root, base, depth)?;
     if report.files == 0 {
-        eprintln!("no working-tree changes against '{base}'");
+        crate::output::note(
+            "no_changes",
+            format!("no working-tree changes against '{base}'"),
+        );
         return Ok(0);
     }
 
@@ -160,12 +166,22 @@ pub fn run(conn: &Connection, root: &Path, base: &str, depth: usize, k: usize) -
         })
     });
 
-    println!(
-        "changes vs {base}: {} files, {} semantic changes",
-        report.files,
-        report.changed.len()
+    crate::output::emit(
+        "changes_summary",
+        json!({
+            "base": base,
+            "files": report.files,
+            "semantic_changes": report.changed.len(),
+        }),
+        format!(
+            "changes vs {base}: {} files, {} semantic changes",
+            report.files,
+            report.changed.len()
+        ),
     );
-    println!("changed:");
+    if !crate::output::is_jsonl() {
+        println!("changed:");
+    }
     let mut max_risk = 0usize;
     for (i, score) in order.iter().take(k) {
         max_risk = max_risk.max(*score);
@@ -193,68 +209,145 @@ pub fn run(conn: &Connection, root: &Path, base: &str, depth: usize, k: usize) -
             signals.push("cross-service".into());
         }
         let at_base = if c.current { "" } else { " at base" };
-        println!(
-            "{}:L{}{}  {}  [{}]  ({})",
-            c.path,
-            c.line,
-            at_base,
-            c.signature,
-            c.service,
-            signals.join(", ")
+        crate::output::emit(
+            "change",
+            json!({
+                "file": c.path,
+                "old_file": c.old_path,
+                "line": c.line,
+                "name": c.name,
+                "kind": c.kind,
+                "container": c.container,
+                "signature": c.signature,
+                "service": c.service,
+                "nature": c.nature.label(),
+                "risk": risk_label(*score),
+                "risk_score": score,
+                "public_api": c.public,
+                "direct_references": direct,
+                "cross_service": crosses,
+                "at_base": !c.current,
+            }),
+            format!(
+                "{}:L{}{}  {}  [{}]  ({})",
+                c.path,
+                c.line,
+                at_base,
+                c.signature,
+                c.service,
+                signals.join(", ")
+            ),
         );
     }
     if report.changed.len() > k {
-        println!(
-            "… and {} more semantic changes (raise -k)",
-            report.changed.len() - k
+        crate::output::emit(
+            "truncation",
+            json!({"section": "changes", "omitted": report.changed.len() - k, "limit": k}),
+            format!(
+                "… and {} more semantic changes (raise -k)",
+                report.changed.len() - k
+            ),
         );
     }
 
     let review: Vec<&Affected> = report.affected.iter().filter(|a| !a.is_test).collect();
-    println!("review surface:");
+    if !crate::output::is_jsonl() {
+        println!("review surface:");
+    }
     if review.is_empty() {
-        println!("-  no graph-linked callers");
+        crate::output::emit(
+            "review_summary",
+            json!({"graph_linked_callers": 0}),
+            "-  no graph-linked callers",
+        );
     } else {
         for a in review.iter().take(k) {
-            println!(
-                "{}:L{}  {}  [{}]  (depth {}, via {})",
-                a.file, a.line, a.signature, a.service, a.depth, a.via
+            crate::output::emit(
+                "affected_symbol",
+                json!({
+                    "file": a.file,
+                    "line": a.line,
+                    "signature": a.signature,
+                    "service": a.service,
+                    "depth": a.depth,
+                    "via": a.via,
+                }),
+                format!(
+                    "{}:L{}  {}  [{}]  (depth {}, via {})",
+                    a.file, a.line, a.signature, a.service, a.depth, a.via
+                ),
             );
         }
         if review.len() > k {
-            println!(
-                "… and {} more affected symbols (raise -k)",
-                review.len() - k
+            crate::output::emit(
+                "truncation",
+                json!({"section": "review", "omitted": review.len() - k, "limit": k}),
+                format!(
+                    "… and {} more affected symbols (raise -k)",
+                    review.len() - k
+                ),
             );
         }
     }
 
-    println!("tests to run:");
+    if !crate::output::is_jsonl() {
+        println!("tests to run:");
+    }
     if tests.is_empty() {
-        println!("-  no graph-linked tests found; run the service-level suite");
+        crate::output::emit(
+            "test_summary",
+            json!({"graph_linked_tests": 0, "fallback": "service_suite"}),
+            "-  no graph-linked tests found; run the service-level suite",
+        );
     } else {
         for a in tests.iter().take(k) {
-            println!(
-                "{}:L{}  {}  [{}]  (depth {}, via {})",
-                a.file, a.line, a.signature, a.service, a.depth, a.via
+            crate::output::emit(
+                "test",
+                json!({
+                    "file": a.file,
+                    "line": a.line,
+                    "signature": a.signature,
+                    "service": a.service,
+                    "depth": a.depth,
+                    "via": a.via,
+                }),
+                format!(
+                    "{}:L{}  {}  [{}]  (depth {}, via {})",
+                    a.file, a.line, a.signature, a.service, a.depth, a.via
+                ),
             );
         }
         if tests.len() > k {
-            println!("… and {} more affected tests (raise -k)", tests.len() - k);
+            crate::output::emit(
+                "truncation",
+                json!({"section": "tests", "omitted": tests.len() - k, "limit": k}),
+                format!("… and {} more affected tests (raise -k)", tests.len() - k),
+            );
         }
     }
 
-    println!(
-        "change risk: {} ({} affected symbols across {} services; {} linked tests)",
-        risk_label(max_risk),
-        report.affected.len(),
-        report
-            .affected
-            .iter()
-            .map(|a| a.service.as_str())
-            .collect::<HashSet<_>>()
-            .len(),
-        tests.len()
+    let affected_services = report
+        .affected
+        .iter()
+        .map(|a| a.service.as_str())
+        .collect::<HashSet<_>>()
+        .len();
+    crate::output::emit(
+        "risk_summary",
+        json!({
+            "risk": risk_label(max_risk),
+            "risk_score": max_risk,
+            "affected_symbols": report.affected.len(),
+            "affected_services": affected_services,
+            "linked_tests": tests.len(),
+        }),
+        format!(
+            "change risk: {} ({} affected symbols across {} services; {} linked tests)",
+            risk_label(max_risk),
+            report.affected.len(),
+            affected_services,
+            tests.len()
+        ),
     );
 
     Ok(report.changed.len() + report.affected.len())
@@ -368,10 +461,31 @@ fn analyze(conn: &Connection, root: &Path, base: &str, depth: usize) -> Result<R
 fn snapshots(language: Language, path: &str, source: &str) -> Result<Vec<Snapshot>> {
     let extracted = language.extract(source)?;
     let lines: Vec<&str> = source.lines().collect();
+    let containers: Vec<Option<String>> = extracted
+        .symbols
+        .iter()
+        .enumerate()
+        .map(|(i, child)| {
+            extracted
+                .symbols
+                .iter()
+                .enumerate()
+                .filter(|(j, parent)| {
+                    *j != i
+                        && parent.start_line <= child.start_line
+                        && parent.end_line >= child.end_line
+                        && (parent.start_line < child.start_line
+                            || parent.end_line > child.end_line)
+                })
+                .min_by_key(|(_, parent)| parent.end_line - parent.start_line)
+                .map(|(_, parent)| parent.name.clone())
+        })
+        .collect();
     Ok(extracted
         .symbols
         .iter()
-        .map(|s| Snapshot {
+        .enumerate()
+        .map(|(i, s)| Snapshot {
             name: s.name.clone(),
             kind: s.kind.clone(),
             start_line: s.start_line,
@@ -381,6 +495,7 @@ fn snapshots(language: Language, path: &str, source: &str) -> Result<Vec<Snapsho
             body_hash: own_body_hash(s, &extracted.symbols, &lines),
             is_test: lang::is_test_symbol(path, s),
             public: is_public(language, s),
+            container: containers[i].clone(),
         })
         .collect())
 }
@@ -506,6 +621,7 @@ fn from_snapshot(
         line: s.start_line,
         name: Some(s.name.clone()),
         kind: Some(s.kind.clone()),
+        container: s.container.clone(),
         signature: s.signature.clone(),
         service: String::new(),
         is_test: s.is_test,
@@ -532,6 +648,7 @@ fn file_level_change(file: &ChangedFile, path: &str, unsupported: bool) -> Chang
         line: 1,
         name: None,
         kind: None,
+        container: None,
         signature: signature.into(),
         service: String::new(),
         is_test: false,
@@ -602,11 +719,17 @@ fn affected_symbols(
                    AND (src.service = ?2 OR EXISTS (
                        SELECT 1 FROM file_imports fi
                        WHERE fi.file = src.file AND fi.name = er.dst_name
-                   ))",
+                   ))
+                   AND (
+                       (er.qualifier IS NOT NULL AND er.qualifier IS ?3)
+                       OR (er.qualifier IS NULL AND (?3 IS NULL OR src.container IS ?3))
+                   )",
             )?;
             direct.extend(
-                refs.query_map(rusqlite::params![name, c.service], |r| r.get::<_, i64>(0))?
-                    .filter_map(|r| r.ok()),
+                refs.query_map(rusqlite::params![name, c.service, c.container], |r| {
+                    r.get::<_, i64>(0)
+                })?
+                .filter_map(|r| r.ok()),
             );
         }
         direct.remove(&0);
@@ -964,6 +1087,50 @@ mod tests {
             .affected
             .iter()
             .any(|a| a.signature.contains("verifies_behavior") && a.is_test && a.depth == 2));
+    }
+
+    #[test]
+    fn deleted_method_recovery_respects_container_and_receiver() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        let before = "object InvoiceService {\n\
+                        val store = scala.collection.mutable.Map.empty[String, String]\n\
+                        def get(id: String): Option[String] = None\n\
+                        def total(id: String): Option[String] = get(id)\n\
+                        def unrelated(id: String): Option[String] = store.get(id)\n\
+                      }\n";
+        std::fs::write(root.join("Invoice.scala"), before).unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+
+        let after = "object InvoiceService {\n\
+                       val store = scala.collection.mutable.Map.empty[String, String]\n\
+                       def total(id: String): Option[String] = get(id)\n\
+                       def unrelated(id: String): Option[String] = store.get(id)\n\
+                     }\n";
+        std::fs::write(root.join("Invoice.scala"), after).unwrap();
+        let db_path = root.join(".repomap.db");
+        let mut conn = crate::db::open(db_path.to_str().unwrap()).unwrap();
+        crate::index::run(&mut conn, root, false, &db_path).unwrap();
+        let report = analyze(&conn, root, "HEAD", 1).unwrap();
+
+        assert!(report.changed.iter().any(|c| {
+            c.nature == Nature::Deleted
+                && c.name.as_deref() == Some("get")
+                && c.container.as_deref() == Some("InvoiceService")
+        }));
+        assert!(report
+            .affected
+            .iter()
+            .any(|a| a.signature.contains("def total")));
+        assert!(!report
+            .affected
+            .iter()
+            .any(|a| a.signature.contains("def unrelated")));
     }
 
     #[test]

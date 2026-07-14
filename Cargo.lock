@@ -694,6 +694,7 @@ dependencies = [
  "rayon",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha1",
  "tempfile",
  "toml",

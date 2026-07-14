@@ -90,14 +90,23 @@ pub struct Reached {
 /// break?" — each frontier is the callers of the previous one. Roots
 /// themselves are not reported; a symbol is reported once, at its shortest
 /// distance.
+#[cfg(test)]
 pub fn impact(conn: &Connection, symbol: &str, max_depth: usize) -> Result<Vec<Reached>> {
     let roots: Vec<i64> = {
         let mut stmt = conn.prepare("SELECT id FROM symbols WHERE name = ?1")?;
         let rows = stmt.query_map([symbol], |r| r.get(0))?;
         rows.collect::<std::result::Result<_, _>>()?
     };
+    impact_from_roots(conn, &roots, max_depth)
+}
+
+pub fn impact_from_roots(
+    conn: &Connection,
+    roots: &[i64],
+    max_depth: usize,
+) -> Result<Vec<Reached>> {
     let mut seen: HashSet<i64> = roots.iter().copied().collect();
-    let mut frontier = roots;
+    let mut frontier = roots.to_vec();
     let mut out = Vec::new();
 
     let mut stmt = conn.prepare("SELECT DISTINCT src_symbol FROM edges WHERE dst_symbol = ?1")?;

@@ -1,7 +1,8 @@
 //! Query commands. Every result is ONE compact line: a pointer, never a body.
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, Row};
+use serde_json::{json, Value};
 
 /// Filters for `find`.
 pub struct FindOpts {
@@ -11,13 +12,68 @@ pub struct FindOpts {
     pub k: usize,
 }
 
+/// A disambiguatable symbol identity used by exact graph queries.
+pub struct SymbolSelector {
+    pub name: String,
+    pub service: Option<String>,
+    pub file: Option<String>,
+    pub kind: Option<String>,
+}
+
+fn selector_sql(
+    alias: &str,
+    selector: &SymbolSelector,
+    params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+) -> String {
+    params.push(Box::new(selector.name.clone()));
+    let name_param = params.len();
+    let mut clauses = vec![format!(
+        "({alias}.name = ?{name_param} OR {alias}.qualified_name = ?{name_param})"
+    )];
+    if let Some(service) = &selector.service {
+        params.push(Box::new(service.clone()));
+        clauses.push(format!("{alias}.service = ?{}", params.len()));
+    }
+    if let Some(file) = &selector.file {
+        params.push(Box::new(file.clone()));
+        let n = params.len();
+        clauses.push(format!(
+            "({alias}.file = ?{n} OR {alias}.file LIKE '%/' || ?{n})"
+        ));
+    }
+    if let Some(kind) = &selector.kind {
+        let mut placeholders = Vec::new();
+        for value in kind_synonyms(kind) {
+            params.push(Box::new(value.to_string()));
+            placeholders.push(format!("?{}", params.len()));
+        }
+        clauses.push(format!("{alias}.kind IN ({})", placeholders.join(", ")));
+    }
+    clauses.join(" AND ")
+}
+
+fn selected_symbol_ids(conn: &Connection, selector: &SymbolSelector) -> Result<Vec<i64>> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let predicate = selector_sql("s", selector, &mut params);
+    let mut stmt = conn.prepare(&format!("SELECT s.id FROM symbols s WHERE {predicate}"))?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| r.get(0))?;
+    rows.collect::<std::result::Result<_, _>>()
+        .map_err(Into::into)
+}
+
 /// One result line. `file` is the repo-relative path as indexed, so the
 /// pointer is directly openable from the repo root.
 struct Pointer {
+    name: String,
+    qualified_name: String,
+    kind: String,
     file: String,
     start_line: i64,
     signature: String,
     enclosing: Option<String>,
+    service: String,
+    language: String,
 }
 
 impl Pointer {
@@ -34,8 +90,23 @@ impl Pointer {
         )
     }
 
-    fn print(&self, suffix: &str) {
-        println!("{}", self.line(suffix));
+    fn emit(&self, event: &str, suffix: &str, extra: Value) {
+        let mut data = json!({
+            "symbol_id": format!("{}#{}#{}", self.file, self.qualified_name, self.kind),
+            "name": self.name,
+            "qualified_name": self.qualified_name,
+            "kind": self.kind,
+            "file": self.file,
+            "start_line": self.start_line,
+            "signature": self.signature,
+            "enclosing": self.enclosing,
+            "service": self.service,
+            "language": self.language,
+        });
+        if let (Some(target), Some(fields)) = (data.as_object_mut(), extra.as_object()) {
+            target.extend(fields.clone());
+        }
+        crate::output::emit(event, data, self.line(suffix));
     }
 }
 
@@ -55,18 +126,27 @@ fn enclosing_sql(alias: &str) -> String {
 // SQL fragment for in-degree (incoming edges), shown by `rank`.
 const INDEG_SQL: &str = "(SELECT count(*) FROM edges WHERE dst_symbol = s.id)";
 
-fn row_to_pointer(
-    file: String,
-    start_line: i64,
-    signature: Option<String>,
-    enclosing: Option<String>,
-) -> Pointer {
-    Pointer {
-        file,
-        start_line,
-        signature: signature.unwrap_or_default(),
-        enclosing,
-    }
+fn pointer_columns(alias: &str) -> String {
+    let enclosing = enclosing_sql(alias);
+    format!(
+        "{alias}.file, {alias}.start_line, {alias}.signature, {enclosing},
+         {alias}.name, {alias}.qualified_name, {alias}.kind,
+         {alias}.service, {alias}.language"
+    )
+}
+
+fn row_to_pointer(row: &Row<'_>) -> rusqlite::Result<Pointer> {
+    Ok(Pointer {
+        file: row.get(0)?,
+        start_line: row.get(1)?,
+        signature: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+        enclosing: row.get(3)?,
+        name: row.get(4)?,
+        qualified_name: row.get(5)?,
+        kind: row.get(6)?,
+        service: row.get(7)?,
+        language: row.get(8)?,
+    })
 }
 
 /// Expand a generic `--kind` into the language-native kinds stored in the
@@ -85,9 +165,9 @@ fn kind_synonyms(kind: &str) -> Vec<&str> {
 }
 
 pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<usize> {
+    let pointer = pointer_columns("s");
     let mut sql = format!(
-        "SELECT s.file, s.start_line, s.signature,
-                {ENCLOSING_SQL}
+        "SELECT {pointer}
          FROM symbols_fts f
          JOIN symbols s ON s.id = f.rowid
          WHERE symbols_fts MATCH ?1"
@@ -118,104 +198,110 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<usize> {
 
     let mut stmt = conn.prepare(&sql)?;
     let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-    let rows = stmt.query_map(pref.as_slice(), |r| {
-        Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-    })?;
+    let rows = stmt.query_map(pref.as_slice(), row_to_pointer)?;
     let mut count = 0;
     for p in rows {
-        p?.print("");
+        p?.emit("symbol", "", json!({"relationship": "match"}));
         count += 1;
     }
     if count == 0 {
-        eprintln!("no matches");
+        crate::output::no_match("no matches");
     }
     Ok(count)
 }
 
-pub fn def(conn: &Connection, symbol: &str) -> Result<usize> {
+pub fn def(conn: &Connection, selector: &SymbolSelector) -> Result<usize> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let predicate = selector_sql("s", selector, &mut params);
+    let pointer = pointer_columns("s");
     let sql = format!(
-        "SELECT s.file, s.start_line, s.signature,
-                {ENCLOSING_SQL}
+        "SELECT {pointer}
          FROM symbols s
-         WHERE s.name = ?1
+         WHERE {predicate}
          ORDER BY s.rank DESC, s.file, s.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([symbol], |r| {
-        Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-    })?;
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), row_to_pointer)?;
     let mut count = 0;
     for p in rows {
-        p?.print("");
+        p?.emit("symbol", "", json!({"relationship": "definition"}));
         count += 1;
     }
     if count == 0 {
-        eprintln!("no definition for '{symbol}'");
+        crate::output::no_match(format!("no definition for '{}'", selector.name));
     }
     Ok(count)
 }
 
-pub fn callers(conn: &Connection, symbol: &str) -> Result<usize> {
+pub fn callers(conn: &Connection, selector: &SymbolSelector) -> Result<usize> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let predicate = selector_sql("d", selector, &mut params);
+    let pointer = pointer_columns("s");
     // Callers = source symbols of edges whose dst is a symbol named `symbol`.
     let sql = format!(
-        "SELECT s.file, s.start_line, s.signature,
-                {ENCLOSING_SQL}, e.kind
+        "SELECT {pointer}, e.kind
          FROM edges e
          JOIN symbols d ON d.id = e.dst_symbol
          JOIN symbols s ON s.id = e.src_symbol
-         WHERE d.name = ?1
+         WHERE {predicate}
          GROUP BY s.id, e.kind
          ORDER BY s.file, s.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([symbol], |r| {
-        let kind: String = r.get(4)?;
-        Ok((
-            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
-            kind,
-        ))
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| {
+        let kind: String = r.get(9)?;
+        Ok((row_to_pointer(r)?, kind))
     })?;
     let mut count = 0;
     for row in rows {
         let (p, kind) = row?;
-        p.print(&format!("  ({kind})"));
+        p.emit(
+            "symbol",
+            &format!("  ({kind})"),
+            json!({"relationship": "caller", "edge_kind": kind}),
+        );
         count += 1;
     }
     if count == 0 {
-        eprintln!("no callers for '{symbol}'");
+        crate::output::no_match(format!("no callers for '{}'", selector.name));
     }
     Ok(count)
 }
 
-pub fn callees(conn: &Connection, symbol: &str) -> Result<usize> {
+pub fn callees(conn: &Connection, selector: &SymbolSelector) -> Result<usize> {
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let predicate = selector_sql("s", selector, &mut params);
     // Callees = destination symbols of edges whose src is named `symbol`.
-    let enclosing_d = enclosing_sql("d");
+    let pointer = pointer_columns("d");
     let sql = format!(
-        "SELECT d.file, d.start_line, d.signature,
-                {enclosing_d}, e.kind
+        "SELECT {pointer}, e.kind
          FROM edges e
          JOIN symbols s ON s.id = e.src_symbol
          JOIN symbols d ON d.id = e.dst_symbol
-         WHERE s.name = ?1
+         WHERE {predicate}
          GROUP BY d.id, e.kind
          ORDER BY d.file, d.start_line"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([symbol], |r| {
-        let kind: String = r.get(4)?;
-        Ok((
-            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
-            kind,
-        ))
+    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt.query_map(refs.as_slice(), |r| {
+        let kind: String = r.get(9)?;
+        Ok((row_to_pointer(r)?, kind))
     })?;
     let mut count = 0;
     for row in rows {
         let (p, kind) = row?;
-        p.print(&format!("  ({kind})"));
+        p.emit(
+            "symbol",
+            &format!("  ({kind})"),
+            json!({"relationship": "callee", "edge_kind": kind}),
+        );
         count += 1;
     }
     if count == 0 {
-        eprintln!("no callees for '{symbol}'");
+        crate::output::no_match(format!("no callees for '{}'", selector.name));
     }
     Ok(count)
 }
@@ -225,9 +311,9 @@ pub fn callees(conn: &Connection, symbol: &str) -> Result<usize> {
 /// within one invocation, not across repos. Orientation: run this (optionally
 /// per service) to learn what a codebase actually revolves around.
 pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<usize> {
+    let pointer = pointer_columns("s");
     let mut sql = format!(
-        "SELECT s.file, s.start_line, s.signature,
-                {ENCLOSING_SQL}, s.rank, {INDEG_SQL}
+        "SELECT {pointer}, s.rank, {INDEG_SQL}
          FROM symbols s"
     );
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -243,15 +329,15 @@ pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<usize>
     let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
     let rows = stmt.query_map(pref.as_slice(), |r| {
         Ok((
-            row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?),
-            r.get::<_, f64>(4)?,
-            r.get::<_, i64>(5)?,
+            row_to_pointer(r)?,
+            r.get::<_, f64>(9)?,
+            r.get::<_, i64>(10)?,
         ))
     })?;
     let results: Vec<(Pointer, f64, i64)> = rows.filter_map(|r| r.ok()).collect();
     let max = results.iter().map(|(_, r, _)| *r).fold(0.0f64, f64::max);
     if results.is_empty() || max <= 0.0 {
-        eprintln!("no ranked symbols (index empty, or no references resolved yet)");
+        crate::output::no_match("no ranked symbols (index empty, or no references resolved yet)");
         return Ok(0);
     }
     for (p, r, indeg) in &results {
@@ -261,45 +347,48 @@ pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<usize>
         } else {
             format!("{indeg} callers")
         };
-        p.print(&format!("  (score {score:.0}, {callers})"));
+        p.emit(
+            "symbol",
+            &format!("  (score {score:.0}, {callers})"),
+            json!({"relationship": "rank", "score": score, "callers": indeg}),
+        );
     }
     Ok(results.len())
 }
 
 /// Transitive blast radius of changing `symbol`: its callers, their callers,
 /// and so on up to `depth` hops, most important first within each hop.
-pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result<usize> {
-    let reached = crate::graph::impact(conn, symbol, depth)?;
+pub fn impact(
+    conn: &Connection,
+    selector: &SymbolSelector,
+    depth: usize,
+    k: usize,
+) -> Result<usize> {
+    let roots = selected_symbol_ids(conn, selector)?;
+    let reached = crate::graph::impact_from_roots(conn, &roots, depth)?;
     if reached.is_empty() {
-        let defined: i64 = conn.query_row(
-            "SELECT count(*) FROM symbols WHERE name = ?1",
-            [symbol],
-            |r| r.get(0),
-        )?;
-        if defined == 0 {
-            eprintln!("no definition for '{symbol}'");
+        if roots.is_empty() {
+            crate::output::no_match(format!("no definition for '{}'", selector.name));
         } else {
-            eprintln!("no impact: nothing references '{symbol}'");
+            crate::output::no_match(format!("no impact: nothing references '{}'", selector.name));
         }
         return Ok(0);
     }
 
     // Pull pointer rows for every reached symbol, then order by (depth, rank
     // desc): nearest and most load-bearing dependents first.
+    let pointer = pointer_columns("s");
     let sql = format!(
-        "SELECT s.file, s.start_line, s.signature, {ENCLOSING_SQL}, s.rank, s.service
+        "SELECT {pointer}, s.rank
          FROM symbols s WHERE s.id = ?1"
     );
     let mut stmt = conn.prepare(&sql)?;
     let mut rows: Vec<(Pointer, usize, f64, String)> = Vec::with_capacity(reached.len());
     for r in &reached {
-        let (p, rank, service) = stmt.query_row([r.id], |row| {
-            Ok((
-                row_to_pointer(row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
-                row.get::<_, f64>(4)?,
-                row.get::<_, String>(5)?,
-            ))
+        let (p, rank) = stmt.query_row([r.id], |row| {
+            Ok((row_to_pointer(row)?, row.get::<_, f64>(9)?))
         })?;
+        let service = p.service.clone();
         rows.push((p, r.depth, rank, service));
     }
     rows.sort_by(|a, b| {
@@ -315,15 +404,32 @@ pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result
     let services: std::collections::HashSet<&str> = rows.iter().map(|(.., s)| s.as_str()).collect();
     let total = rows.len();
     for (p, d, ..) in rows.iter().take(k) {
-        p.print(&format!("  (depth {d})"));
+        p.emit(
+            "symbol",
+            &format!("  (depth {d})"),
+            json!({"relationship": "impact", "depth": d}),
+        );
     }
     if total > k {
-        println!("… and {} more (raise -k)", total - k);
+        crate::output::emit(
+            "truncation",
+            json!({"omitted": total - k, "limit": k}),
+            format!("… and {} more (raise -k)", total - k),
+        );
     }
-    println!(
-        "impact: {total} symbols in {} files across {} services (depth ≤ {depth})",
-        files.len(),
-        services.len()
+    crate::output::emit(
+        "summary",
+        json!({
+            "symbols": total,
+            "files": files.len(),
+            "services": services.len(),
+            "max_depth": depth,
+        }),
+        format!(
+            "impact: {total} symbols in {} files across {} services (depth ≤ {depth})",
+            files.len(),
+            services.len()
+        ),
     );
     Ok(total.min(k))
 }
@@ -331,29 +437,26 @@ pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result
 pub fn outline(conn: &Connection, file: &str) -> Result<usize> {
     // Exact repo-relative path first; fall back to a suffix match so
     // `outline Invoice.scala` works without spelling the full path.
-    let base = format!(
-        "SELECT s.file, s.start_line, s.signature,
-                {ENCLOSING_SQL}
-         FROM symbols s"
-    );
+    let pointer = pointer_columns("s");
+    let base = format!("SELECT {pointer} FROM symbols s");
     let exact = format!("{base} WHERE s.file = ?1 ORDER BY s.start_line");
     let suffix = format!("{base} WHERE s.file LIKE '%' || ?1 ORDER BY s.file, s.start_line");
 
     for sql in [&exact, &suffix] {
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([file], |r| {
-            Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?;
+        let rows = stmt.query_map([file], row_to_pointer)?;
         let mut count = 0;
         for p in rows {
-            p?.print("");
+            p?.emit("symbol", "", json!({"relationship": "outline"}));
             count += 1;
         }
         if count > 0 {
             return Ok(count);
         }
     }
-    eprintln!("no symbols for '{file}' (not indexed, or no definitions in it)");
+    crate::output::no_match(format!(
+        "no symbols for '{file}' (not indexed, or no definitions in it)"
+    ));
     Ok(0)
 }
 
@@ -377,8 +480,20 @@ pub fn map(conn: &Connection) -> Result<usize> {
         let stack = stack.unwrap_or_else(|| "?".into());
         let entry =
             first_json_item(entrypoints.as_deref().unwrap_or("[]")).unwrap_or_else(|| "-".into());
-        println!("{name}  ({stack})  {nfiles} files  {entry}");
+        crate::output::emit(
+            "service",
+            json!({
+                "name": name,
+                "stack": stack,
+                "files": nfiles,
+                "entrypoint": entry,
+            }),
+            format!("{name}  ({stack})  {nfiles} files  {entry}"),
+        );
         count += 1;
+    }
+    if count == 0 {
+        crate::output::no_match("no services (index contains no supported source files)");
     }
     Ok(count)
 }
@@ -389,12 +504,16 @@ pub fn map(conn: &Connection) -> Result<usize> {
 pub fn show_db(path: &str) -> Result<()> {
     let file = std::path::Path::new(path);
     if !file.exists() {
-        println!("{path}  (not indexed yet — run `repomap index`)");
+        crate::output::emit(
+            "database",
+            json!({"path": path, "exists": false}),
+            format!("{path}  (not indexed yet — run `repomap index`)"),
+        );
         return Ok(());
     }
 
     let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
-    let conn = Connection::open(path)?;
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let count = |table: &str| -> i64 {
         conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
             .unwrap_or(0)
@@ -403,19 +522,53 @@ pub fn show_db(path: &str) -> Result<()> {
         .query_row("SELECT max(indexed_at) FROM files", [], |r| r.get(0))
         .ok()
         .flatten();
+    let repository_root: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'repository_root'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
 
-    println!("{path}");
-    println!("  size      {} KiB", size / 1024);
-    println!("  services  {}", count("services"));
-    println!("  files     {}", count("files"));
-    println!("  symbols   {}", count("symbols"));
-    println!("  edges     {}", count("edges"));
-    if let Some(summary) = crate::usage::summary_line(&conn) {
-        println!("  usage     {summary}");
-    }
-    match indexed_at {
-        Some(ts) => println!("  indexed   {ts} (epoch seconds)"),
-        None => println!("  indexed   never"),
+    let services = count("services");
+    let files = count("files");
+    let symbols = count("symbols");
+    let edges = count("edges");
+    let usage = crate::usage::summary_line(&conn);
+    if crate::output::is_jsonl() {
+        crate::output::emit(
+            "database",
+            json!({
+                "path": path,
+                "exists": true,
+                "size_bytes": size,
+                "services": services,
+                "files": files,
+                "symbols": symbols,
+                "edges": edges,
+                "usage": usage,
+                "indexed_at_epoch": indexed_at,
+                "repository_root": repository_root,
+            }),
+            "",
+        );
+    } else {
+        println!("{path}");
+        println!("  size      {} KiB", size / 1024);
+        println!("  services  {services}");
+        println!("  files     {files}");
+        println!("  symbols   {symbols}");
+        println!("  edges     {edges}");
+        if let Some(root) = repository_root {
+            println!("  root      {root}");
+        }
+        if let Some(summary) = usage {
+            println!("  usage     {summary}");
+        }
+        match indexed_at {
+            Some(ts) => println!("  indexed   {ts} (epoch seconds)"),
+            None => println!("  indexed   never"),
+        }
     }
     Ok(())
 }
@@ -425,7 +578,11 @@ pub fn show_db(path: &str) -> Result<()> {
 pub fn clear_db(path: &str) -> Result<()> {
     let file = std::path::Path::new(path);
     if !file.exists() {
-        println!("{path}  (nothing to clear)");
+        crate::output::emit(
+            "database_cleared",
+            json!({"path": path, "cleared": false}),
+            format!("{path}  (nothing to clear)"),
+        );
         return Ok(());
     }
     std::fs::remove_file(file)?;
@@ -435,7 +592,11 @@ pub fn clear_db(path: &str) -> Result<()> {
             std::fs::remove_file(&sidecar)?;
         }
     }
-    println!("{path}  (cleared)");
+    crate::output::emit(
+        "database_cleared",
+        json!({"path": path, "cleared": true}),
+        format!("{path}  (cleared)"),
+    );
     Ok(())
 }
 
@@ -497,20 +658,30 @@ mod tests {
         // The path must be the file as indexed (repo-relative), NOT prefixed
         // by the owning service's name — those diverge for manifest services.
         let p = Pointer {
+            name: "Invoice".into(),
+            qualified_name: "Invoice".into(),
+            kind: "class".into(),
             file: "fixtures/billing/src/Invoice.scala".into(),
             start_line: 7,
             signature: "case class Invoice(id: String)".into(),
             enclosing: None,
+            service: "billing".into(),
+            language: "scala".into(),
         };
         assert_eq!(
             p.line(""),
             "fixtures/billing/src/Invoice.scala:L7  case class Invoice(id: String)  [-]"
         );
         let q = Pointer {
+            name: "inner".into(),
+            qualified_name: "outer::inner".into(),
+            kind: "fn".into(),
             file: "a.rs".into(),
             start_line: 1,
             signature: String::new(),
             enclosing: Some("outer".into()),
+            service: "root".into(),
+            language: "rust".into(),
         };
         assert_eq!(q.line("  (call)"), "a.rs:L1  -  [outer]  (call)");
     }
@@ -552,6 +723,51 @@ mod tests {
         assert_eq!(kind_synonyms("fn"), vec!["fn", "function"]);
         assert_eq!(kind_synonyms("module"), vec!["module", "mod"]);
         assert_eq!(kind_synonyms("struct"), vec!["struct"]);
+    }
+
+    #[test]
+    fn symbol_selector_supports_qualified_names_and_file_suffixes() {
+        let conn = crate::db::open(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files(path, service, language, loc, git_hash, indexed_at)
+             VALUES ('src/a.rs', 'app', 'rust', 1, 'a', 0),
+                    ('src/b.rs', 'app', 'rust', 1, 'b', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(name, qualified_name, kind, file, start_line, end_line,
+                                 service, language)
+             VALUES ('get', 'A::get', 'fn', 'src/a.rs', 1, 1, 'app', 'rust'),
+                    ('get', 'B::get', 'fn', 'src/b.rs', 1, 1, 'app', 'rust')",
+            [],
+        )
+        .unwrap();
+
+        let qualified = SymbolSelector {
+            name: "A::get".into(),
+            service: None,
+            file: None,
+            kind: None,
+        };
+        assert_eq!(selected_symbol_ids(&conn, &qualified).unwrap().len(), 1);
+
+        let by_file = SymbolSelector {
+            name: "get".into(),
+            service: Some("app".into()),
+            file: Some("b.rs".into()),
+            kind: Some("function".into()),
+        };
+        let ids = selected_symbol_ids(&conn, &by_file).unwrap();
+        assert_eq!(ids.len(), 1);
+        let qualified: String = conn
+            .query_row(
+                "SELECT qualified_name FROM symbols WHERE id = ?1",
+                [ids[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qualified, "B::get");
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub struct RawSymbol {
 pub struct RawEdge {
     pub src_line: usize,
     pub dst_name: String,
+    /// Last identifier before a member/scoped call (`TaxCalculator` in
+    /// `TaxCalculator.withTax`). `None` denotes a bare call.
+    pub qualifier: Option<String>,
     pub kind: String, // call | import | extends
 }
 
@@ -155,12 +158,51 @@ fn push_edge(edges: &mut Vec<RawEdge>, node: Node, bytes: &[u8], kind: &str, is_
         raw.to_string()
     };
     if !dst.is_empty() {
+        let qualifier = if kind == "call" {
+            call_qualifier(node, bytes)
+        } else {
+            None
+        };
         edges.push(RawEdge {
             src_line: node.start_position().row + 1,
             dst_name: dst,
+            qualifier,
             kind: kind.to_string(),
         });
     }
+}
+
+/// Recover the syntactic receiver/module for a captured member or scoped
+/// call. We deliberately keep only its last identifier: it is enough to link
+/// `TaxCalculator.withTax` to a method owned by `TaxCalculator`, while an
+/// instance call such as `store.get` will stay unresolved instead of being
+/// guessed to an unrelated same-named method.
+fn call_qualifier(node: Node, bytes: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let kind = parent.kind();
+    if !(kind.contains("field")
+        || kind.contains("member")
+        || kind.contains("attribute")
+        || kind.contains("scoped"))
+    {
+        return None;
+    }
+    let prefix = bytes.get(parent.start_byte()..node.start_byte())?;
+    let prefix = std::str::from_utf8(prefix).ok()?;
+    last_identifier(prefix)
+}
+
+fn last_identifier(s: &str) -> Option<String> {
+    let ident: String = s
+        .chars()
+        .rev()
+        .skip_while(|c| !(c.is_alphanumeric() || *c == '_'))
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    (!ident.is_empty()).then_some(ident)
 }
 
 fn text<'a>(node: Node, bytes: &'a [u8]) -> &'a str {
@@ -249,6 +291,16 @@ mod tests {
         assert_eq!(last_segment("a.b.c;"), "c"); // trailing punctuation stripped
         assert_eq!(last_segment("use std::collections::HashMap;"), "HashMap");
         assert_eq!(last_segment("plain"), "plain");
+    }
+
+    #[test]
+    fn last_identifier_skips_member_punctuation() {
+        assert_eq!(
+            last_identifier("TaxCalculator."),
+            Some("TaxCalculator".into())
+        );
+        assert_eq!(last_identifier("crate::billing::"), Some("billing".into()));
+        assert_eq!(last_identifier("."), None);
     }
 
     #[test]

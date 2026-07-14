@@ -13,6 +13,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde_json::json;
 
 /// The skill markdown, baked into the binary at compile time.
 const SKILL_MD: &str = include_str!("../skills/repomap/SKILL.md");
@@ -60,7 +61,11 @@ fn install_owned(root: &Path, rel_path: &str) -> Result<()> {
             .with_context(|| format!("creating skill directory {}", parent.display()))?;
     }
     fs::write(&dest, SKILL_MD).with_context(|| format!("writing skill to {}", dest.display()))?;
-    println!("Installed repomap skill -> {}", dest.display());
+    crate::output::emit(
+        "skill_install",
+        json!({"destination": dest, "updated": false}),
+        format!("Installed repomap skill -> {}", dest.display()),
+    );
     Ok(())
 }
 
@@ -84,7 +89,11 @@ fn install_shared(root: &Path, rel_path: &str) -> Result<()> {
     } else {
         "Updated"
     };
-    println!("{verb} repomap skill -> {}", dest.display());
+    crate::output::emit(
+        "skill_install",
+        json!({"destination": dest, "updated": !existing.trim().is_empty()}),
+        format!("{verb} repomap skill -> {}", dest.display()),
+    );
     Ok(())
 }
 

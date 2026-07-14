@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context};
+use serde_json::json;
 
 /// Install the running executable into a user bin directory on `$PATH`.
 pub fn install() -> anyhow::Result<()> {
@@ -38,13 +39,21 @@ pub fn install() -> anyhow::Result<()> {
     }
 
     copy_binary(&source, &dest)?;
-    println!("Installed {} -> {}", source.display(), dest.display());
+    crate::output::emit(
+        "install",
+        json!({"source": source, "destination": dest}),
+        format!("Installed {} -> {}", source.display(), dest.display()),
+    );
 
     if !path_contains(&path_var, &target_dir) {
-        eprintln!();
-        eprintln!("warning: {} is not on your PATH.", target_dir.display());
-        eprintln!("Add it to your shell profile, e.g.:");
-        eprintln!("    export PATH=\"{}:$PATH\"", target_dir.display());
+        crate::output::warning(
+            "install_dir_not_on_path",
+            format!(
+                "{} is not on PATH; add `export PATH=\"{}:$PATH\"` to your shell profile",
+                target_dir.display(),
+                target_dir.display()
+            ),
+        );
     }
     Ok(())
 }

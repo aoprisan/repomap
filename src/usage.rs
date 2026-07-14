@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use rusqlite::Connection;
+use serde_json::json;
 
 use crate::index::epoch_secs;
 
@@ -75,10 +76,12 @@ pub fn report(conn: &Connection) -> Result<()> {
         ))
     })?;
 
-    println!(
-        "{:<10} {:>7} {:>8} {:>15}  last_used",
-        "command", "runs", "results", "~tokens_saved"
-    );
+    if !crate::output::is_jsonl() {
+        println!(
+            "{:<10} {:>7} {:>8} {:>15}  last_used",
+            "command", "runs", "results", "~tokens_saved"
+        );
+    }
     let (mut total_runs, mut total_results, mut total_saved) = (0i64, 0i64, 0i64);
     let mut any = false;
     for row in rows {
@@ -87,29 +90,57 @@ pub fn report(conn: &Connection) -> Result<()> {
         total_results += results;
         total_saved += saved;
         any = true;
-        println!(
-            "{:<10} {:>7} {:>8} {:>15}  {}",
-            cmd, runs, results, saved, last
+        crate::output::emit(
+            "usage",
+            json!({
+                "query_command": cmd,
+                "runs": runs,
+                "results": results,
+                "estimated_tokens_saved": saved,
+                "last_used_epoch": last,
+            }),
+            format!(
+                "{:<10} {:>7} {:>8} {:>15}  {}",
+                cmd, runs, results, saved, last
+            ),
         );
     }
     if !any {
-        println!("(no usage recorded yet — run a `find`/`def`/`callers`/`map`)");
+        crate::output::emit(
+            "usage_summary",
+            json!({"runs": 0, "results": 0, "estimated_tokens_saved": 0}),
+            "(no usage recorded yet — run a `find`/`def`/`callers`/`map`)",
+        );
         return Ok(());
     }
-    println!(
-        "{:<10} {:>7} {:>8} {:>15}",
-        "total", total_runs, total_results, total_saved
+    crate::output::emit(
+        "usage_summary",
+        json!({
+            "runs": total_runs,
+            "results": total_results,
+            "estimated_tokens_saved": total_saved,
+        }),
+        format!(
+            "{:<10} {:>7} {:>8} {:>15}",
+            "total", total_runs, total_results, total_saved
+        ),
     );
-    println!(
-        "\n~tokens_saved is a rough estimate: each result pointer stands in for\nopening ~one average indexed file the agent didn't have to read.\nlast_used is epoch seconds."
-    );
+    if !crate::output::is_jsonl() {
+        println!(
+            "\n~tokens_saved is a rough estimate: each result pointer stands in for\nopening ~one average indexed file the agent didn't have to read.\nlast_used is epoch seconds."
+        );
+    }
     Ok(())
 }
 
 /// Clear all usage history.
 pub fn reset(conn: &Connection) -> Result<()> {
     conn.execute("DELETE FROM usage", [])?;
-    println!("usage stats cleared");
+    crate::output::emit(
+        "usage_reset",
+        json!({"cleared": true}),
+        "usage stats cleared",
+    );
     Ok(())
 }
 

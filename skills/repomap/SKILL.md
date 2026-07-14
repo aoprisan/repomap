@@ -22,7 +22,8 @@ The index lives in `./.repomap.db` and **maintains itself**: every query
 command first refreshes the index (a full build on first use, an incremental
 one after), so you can run `repomap find …` immediately and after editing
 files — results always reflect the working tree. Pass `--no-refresh` to answer
-from the index as-is.
+from the index as-is. Refresh failures fail closed; `--allow-stale` explicitly
+returns the older index with exit status 4.
 
 To build or refresh explicitly:
 
@@ -45,9 +46,11 @@ If `repomap` is not on PATH, build and install it: `cargo build --release &&
 
 ## Commands
 
-All output is one pointer per line. Global flags work on any subcommand:
+Text output is one pointer per line. Global flags work on any subcommand:
 `--root <dir>` (repo root, default `.`), `--db <path>` (default
-`<root>/.repomap.db`).
+`<root>/.repomap.db`), and `--format jsonl` for versioned structured output.
+Exit 3 means a lookup had no results; exit 4 means `--allow-stale` returned
+results from an older index; other nonzero statuses are failures.
 
 ### `repomap map`
 List services as `name  (stack)  N files  entrypoint`. Start here to orient in
@@ -66,7 +69,7 @@ repomap find handle --lang rust   # Rust symbols starting "handle"
 repomap find get --service billing -k 5
 ```
 
-### `repomap def <symbol>`
+### `repomap def <symbol> [--service S] [--file F] [--kind K]`
 Definition site(s) of an exact symbol name. Use to jump straight to where
 something is declared.
 
@@ -74,7 +77,7 @@ something is declared.
 repomap def TaxCalculator
 ```
 
-### `repomap callers <symbol>`
+### `repomap callers <symbol> [--service S] [--file F] [--kind K]`
 Symbols with an edge (call / `extends` / import) pointing at `<symbol>` — i.e.
 who uses it. Each line ends with the edge kind, e.g. `(call)`.
 
@@ -82,7 +85,7 @@ who uses it. Each line ends with the edge kind, e.g. `(call)`.
 repomap callers get
 ```
 
-### `repomap callees <symbol>`
+### `repomap callees <symbol> [--service S] [--file F] [--kind K]`
 The inverse: symbols that `<symbol>` points at — what it calls, extends, or
 imports. Use it to see a function's dependencies before changing it.
 
@@ -90,12 +93,15 @@ imports. Use it to see a function's dependencies before changing it.
 repomap callees total
 ```
 
-> **Caveat:** edges are resolved best-effort by name. A bare reference resolves
-> within the source's **own service** (same-file definition preferred); a name
-> the source file **imports** may also resolve across services. Anything else
-> is dropped rather than guessed — so `callers`/`callees` can still miss some
-> cross-service links. Treat their output as a strong hint, not an exhaustive
-> list, and confirm by reading the cited `file:line`.
+`<symbol>` may be qualified (`InvoiceService::get`). Use `--service`, `--file`
+(exact path or suffix), and `--kind` when names repeat.
+
+> **Caveat:** calls belong to the innermost callable. Bare calls prefer the
+> same lexical container and otherwise resolve only to a unique same-file or
+> same-service definition. Qualified calls resolve to a method owned by the
+> qualifier; ambiguous or unknown instance receivers are dropped instead of
+> guessed. Imports may license unique cross-service links. The graph is
+> deliberately conservative and can omit dynamic dispatch.
 
 ### `repomap outline <file>`
 All symbols defined in one file, in source order. Accepts the exact
@@ -118,7 +124,7 @@ repomap rank -k 10
 repomap rank --service billing
 ```
 
-### `repomap impact <symbol> [--depth N] [-k N]`
+### `repomap impact <symbol> [--service S] [--file F] [--kind K] [--depth N] [-k N]`
 Transitive blast radius: callers, callers-of-callers, … up to `--depth` hops
 (default 2), each tagged `(depth d)`, nearest first, with a closing summary of
 symbols/files/services touched. Run this **before changing a shared symbol**

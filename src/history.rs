@@ -10,6 +10,7 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 use rusqlite::Connection;
+use serde_json::json;
 
 /// Commits touching more than this many files are skipped: mass renames and
 /// formatting sweeps assert coupling between everything and everything, which
@@ -33,11 +34,11 @@ pub fn cochange(
     let (target_commits, coupled) = couple(&parsed, &target);
 
     if target_commits == 0 {
-        eprintln!(
+        crate::output::no_match(format!(
             "no commits touching '{target}' in the last {} mined ({} requested)",
             parsed.len(),
             commits
-        );
+        ));
         return Ok(0);
     }
 
@@ -50,12 +51,23 @@ pub fn cochange(
     rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
     if rows.is_empty() {
-        eprintln!("no co-change partners for '{target}' ({target_commits} commits mined)");
+        crate::output::no_match(format!(
+            "no co-change partners for '{target}' ({target_commits} commits mined)"
+        ));
         return Ok(0);
     }
     for (path, together) in rows.iter().take(k) {
         let pct = *together as f64 / target_commits as f64 * 100.0;
-        println!("{path}  {together}/{target_commits} commits ({pct:.0}%)");
+        crate::output::emit(
+            "cochange",
+            json!({
+                "file": path,
+                "together_commits": together,
+                "target_commits": target_commits,
+                "confidence_percent": pct,
+            }),
+            format!("{path}  {together}/{target_commits} commits ({pct:.0}%)"),
+        );
     }
     Ok(rows.len().min(k))
 }

@@ -83,7 +83,9 @@ No setup step: **query commands refresh the index automatically** before
 answering — a full build on first use (writing `./.repomap.db`), an
 incremental one after — so results always reflect the working tree, even right
 after you edit files. When a refresh actually reindexed something, a one-line
-note goes to stderr; pass `--no-refresh` to answer from the index as-is.
+note goes to stderr. A failed refresh fails the query instead of silently
+returning stale pointers. Pass `--allow-stale` to explicitly accept the older
+index (exit status 4), or `--no-refresh` to intentionally skip refresh.
 `repomap index` is still there for building explicitly (e.g. in CI or a
 pre-commit hook).
 
@@ -94,6 +96,8 @@ Global flags (valid on any subcommand):
 | `--root <dir>` | `.` | Repo root to index/query |
 | `--db <path>` | `<root>/.repomap.db` | Index database location |
 | `--no-refresh` | | Skip the automatic index refresh before a query |
+| `--allow-stale` | | Answer from the older index if refresh fails; exit 4 |
+| `--format <text\|jsonl>` | `text` | Human output or versioned JSON Lines |
 | `--show-db` | | Print the resolved database path and stats, then exit |
 | `--clear-db` | | Delete the resolved database (and its WAL/SHM sidecars), then exit |
 
@@ -109,6 +113,7 @@ $ repomap --show-db
   files     14
   symbols   120
   edges     109
+  root      /work/acme
   indexed   1780942229 (epoch seconds)
 
 $ repomap --db /tmp/other.db --show-db
@@ -178,7 +183,7 @@ fixtures/billing/src/main/scala/billing/Invoice.scala:L7  case class Invoice(id:
 fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
 ```
 
-### `def <symbol>`
+### `def <symbol> [--service S] [--file F] [--kind K]`
 
 Definition site(s) of a symbol, one line each.
 
@@ -187,24 +192,28 @@ $ repomap def TaxCalculator
 fixtures/billing/src/main/scala/billing/tax/TaxCalculator.scala:L3  object TaxCalculator  [-]
 ```
 
-### `callers <symbol>`
+### `callers <symbol> [--service S] [--file F] [--kind K]`
 
 Symbols that have an edge pointing at `<symbol>` (calls, `extends`, imports),
 one line each.
 
 ```
 $ repomap callers get
-fixtures/billing/src/main/scala/billing/Invoice.scala:L23  val base = get(id).map(_.amountCents).getOrElse(0L)  [total]  (call)
+fixtures/billing/src/main/scala/billing/Invoice.scala:L22  def total(id: String): Long =  [InvoiceService]  (call)
 ```
 
-> **Note:** edges are resolved best-effort by name. A bare reference resolves
-> within the source's **own service** (same-file definition preferred). A name
-> the source file **imports** may additionally resolve across service
-> boundaries — the import is explicit evidence the reference points outside.
-> Anything else is dropped rather than guessed, so `get`/`apply`-style common
-> names never cross-link to unrelated symbols in other services.
+`<symbol>` accepts a qualified lexical name such as `InvoiceService::get`.
+Use `--service`, `--file` (exact path or suffix), and `--kind` to disambiguate
+repeated names.
 
-### `callees <symbol>`
+> **Note:** calls are owned by their innermost callable rather than local
+> variables. Bare calls first resolve to a sibling in the same lexical
+> container, then only to a unique same-file or same-service definition.
+> Qualified calls such as `TaxCalculator.withTax` resolve to a method owned by
+> that qualifier. Ambiguous and unknown instance-receiver calls are dropped
+> instead of guessed; explicit imports can license unique cross-service edges.
+
+### `callees <symbol> [--service S] [--file F] [--kind K]`
 
 The inverse of `callers`: symbols that `<symbol>` has an edge pointing at —
 what it calls, extends, or imports.
@@ -248,7 +257,7 @@ src/query.rs:L350  pub fn map(conn: &Connection) -> Result<()>  [-]  (score 32, 
 (Note the second line: more callers, lower score — *who* references you
 matters, not just how many.)
 
-### `impact <symbol> [--depth N] [-k N]`
+### `impact <symbol> [--service S] [--file F] [--kind K] [--depth N] [-k N]`
 
 The transitive blast radius of changing `<symbol>`: its callers, their
 callers, and so on up to `--depth` hops (default 2), each line tagged with its
@@ -262,6 +271,23 @@ src/index.rs:L541  pub fn refresh(...) -> Result<()>  [-]  (depth 2)
 src/main.rs:L21  fn main() -> Result<()>  [-]  (depth 2)
 impact: 9 symbols in 2 files across 1 services (depth ≤ 2)
 ```
+
+### Machine-readable output and exit statuses
+
+Pass `--format jsonl` to any command. Every stdout result and stderr diagnostic
+is one complete object with `schema_version: 1`, `command`, `type`, and a
+structured `data` object. Symbol records include a lexical `qualified_name`,
+filters, and a deterministic `symbol_id` derived from file, qualified name, and
+kind.
+
+```json
+{"schema_version":1,"command":"find","type":"symbol","data":{"name":"total","qualified_name":"InvoiceService::total","file":"src/Invoice.scala","start_line":22,"relationship":"match"}}
+```
+
+Exit statuses are part of the contract: `0` fresh success, `1` command failure,
+`3` a lookup with no results, and `4` results returned from an explicitly
+allowed stale index. `--no-refresh` is an intentional snapshot query and exits
+normally.
 
 ### `cochange <file> [--commits N] [-k N]`
 
@@ -385,11 +411,12 @@ misattributes them to a sibling service.
   capture-name conventions: `@def.<kind>` + `@name` → a symbol;
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.
 - **Store** — symbols and FTS live in SQLite (bundled rusqlite, FTS5). Edges are
-  stored name-keyed in `edge_raw`, then rebuilt into `edges` when indexed files
-  change by resolving destination names to symbol ids — same service, or
-  cross-service when the source file imports the name; same-file preferred,
-  self-edges excluded (see the note under `callers`). Imported names are
-  recorded per file in `file_imports`, including top-level imports.
+  stored with their bare/qualified reference in `edge_raw`, then rebuilt into
+  `edges` when indexed files change. Symbols carry lexical container and
+  qualified-name identity. Resolution prefers the same lexical container and
+  otherwise accepts only unique scoped candidates; self-edges and ambiguous
+  guesses are excluded. Imported names are recorded per file in
+  `file_imports`, including top-level imports.
 - **Rank** — after edges are resolved, PageRank runs over the symbol graph
   (damping 0.85, importance flowing along references) and is stored on each
   symbol; `rank` reads it directly and `find`/`def` use it as a tie-breaker.
@@ -403,6 +430,10 @@ misattributes them to a sibling service.
   untouched, or — when the stat moved — its git blob hash (pure-Rust,
   `git hash-object`-compatible) still matches. Query commands run an
   incremental pass automatically before answering.
+- **Safety** — roots are validated and canonicalized before the database is
+  opened, each database is bound to one canonical repository, and rebuild
+  mutations commit atomically. Refresh failures fail closed unless
+  `--allow-stale` is explicit.
 - **Migrations** — the derived index is a cache: on a schema-version bump,
   `repomap` drops and rebuilds it on the next (auto-)index instead of migrating
   in place. Lifetime usage totals are preserved.

@@ -3,9 +3,9 @@
 //! (incremental by git blob hash), then resolve edges by name.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
@@ -41,6 +41,7 @@ struct Candidate {
     lang: Language,
 }
 
+#[derive(Debug)]
 pub struct Summary {
     pub files_indexed: usize,
     pub files_skipped: usize,
@@ -59,8 +60,10 @@ pub fn run(
     incremental: bool,
     db_file: &Path,
 ) -> Result<Summary> {
-    let candidates = scan(root, db_file);
-    let resolver = build_services(root, &candidates)?;
+    let root = canonical_root(root)?;
+    check_root_binding(conn, &root)?;
+    let candidates = scan(&root, db_file)?;
+    let resolver = build_services(&root, &candidates)?;
 
     // Incremental runs skip unchanged files — but a file's stored service
     // comes from index time, so a changed repomap.toml (or changed inferred
@@ -82,14 +85,6 @@ pub fn run(
             incremental = false;
             mode = "full: service definitions changed";
         }
-    }
-
-    write_services(conn, &resolver)?;
-
-    if !incremental {
-        // Full reindex: drop everything derived from files (cascades to
-        // symbols/edges). Services were just rewritten above.
-        conn.execute("DELETE FROM files", [])?;
     }
 
     let now = epoch_secs();
@@ -119,7 +114,11 @@ pub fn run(
     // Determinate bar over the scanned candidates. indicatif draws to stderr
     // and hides itself when stderr is not a TTY, so piped/scripted runs stay
     // clean and only the final summary line (stdout) survives.
-    let bar = ProgressBar::new(candidates.len() as u64);
+    let bar = if crate::output::is_jsonl() {
+        ProgressBar::hidden()
+    } else {
+        ProgressBar::new(candidates.len() as u64)
+    };
     bar.set_style(
         ProgressStyle::with_template("{spinner} [{bar:30}] {pos}/{len} files {wide_msg}")
             .unwrap()
@@ -132,7 +131,7 @@ pub fn run(
     let outcomes: Vec<Outcome> = candidates
         .par_iter()
         .map(|c| {
-            let out = examine(root, c, stored.get(&c.rel));
+            let out = examine(&root, c, stored.get(&c.rel));
             bar.inc(1);
             bar.set_message(c.rel.clone());
             out
@@ -140,6 +139,13 @@ pub fn run(
         .collect();
 
     let tx = conn.transaction()?;
+    // All derived-index mutations belong to the same transaction. A failed
+    // extraction, service write, or graph rebuild therefore leaves the
+    // previously usable index intact instead of exposing a half-rebuilt one.
+    write_services(&tx, &resolver)?;
+    if !incremental {
+        tx.execute("DELETE FROM files", [])?;
+    }
     for (c, outcome) in candidates.iter().zip(outcomes) {
         match outcome {
             Outcome::Unchanged => skipped += 1,
@@ -152,7 +158,9 @@ pub fn run(
                 )?;
                 skipped += 1;
             }
-            Outcome::Unreadable => {}
+            Outcome::Unreadable(error) => {
+                return Err(error).with_context(|| format!("reading source file '{}'", c.rel));
+            }
             Outcome::Index {
                 existed,
                 loc,
@@ -224,6 +232,10 @@ pub fn run(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('services_fingerprint', ?1)",
         [&fingerprint],
     )?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('repository_root', ?1)",
+        [root.to_string_lossy().as_ref()],
+    )?;
     tx.commit()?;
     bar.finish_and_clear();
 
@@ -264,7 +276,7 @@ fn services_fingerprint(resolver: &Resolver) -> String {
 /// files (generated bundles, minified JS) are dropped. Entries are sorted so
 /// symbol-id assignment — and therefore edge-resolution tie-breaks — is
 /// deterministic across runs.
-fn scan(root: &Path, db_file: &Path) -> Vec<Candidate> {
+fn scan(root: &Path, db_file: &Path) -> Result<Vec<Candidate>> {
     let mut out = Vec::new();
     let mut builder = WalkBuilder::new(root);
     builder
@@ -281,7 +293,8 @@ fn scan(root: &Path, db_file: &Path) -> Vec<Candidate> {
                 true
             }
         });
-    for entry in builder.build().filter_map(|e| e.ok()) {
+    for entry in builder.build() {
+        let entry = entry.with_context(|| format!("walking repository '{}'", root.display()))?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -305,7 +318,45 @@ fn scan(root: &Path, db_file: &Path) -> Vec<Candidate> {
             }
         }
     }
-    out
+    Ok(out)
+}
+
+/// Resolve and validate a repository root before any database mutation.
+/// Canonicalization also gives the database a stable identity across `.` / symlink
+/// spellings of the same checkout.
+pub fn canonical_root(root: &Path) -> Result<PathBuf> {
+    if !root.exists() {
+        bail!("repository root '{}' does not exist", root.display());
+    }
+    if !root.is_dir() {
+        bail!("repository root '{}' is not a directory", root.display());
+    }
+    std::fs::canonicalize(root)
+        .with_context(|| format!("canonicalizing repository root '{}'", root.display()))
+}
+
+/// Reject accidental reuse of one database for another checkout. Older
+/// databases have no binding and are adopted on their next successful index.
+pub fn check_root_binding(conn: &Connection, root: &Path) -> Result<()> {
+    let Some(stored) = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'repository_root'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    else {
+        return Ok(());
+    };
+    let current = canonical_root(root)?;
+    if stored != current.to_string_lossy() {
+        bail!(
+            "index belongs to repository '{}', not '{}' (choose the matching --db or clear it)",
+            stored,
+            current.display()
+        );
+    }
+    Ok(())
 }
 
 /// Manifest services if present, else infer one per top-level dir using the
@@ -369,9 +420,9 @@ enum Outcome {
     Unchanged,
     /// Stat moved but content hash matched: just refresh the stored stat.
     Touched { mtime: i64, size: i64 },
-    /// The file vanished or can't be read; leave it alone (a deletion is
-    /// handled by the stale-purge pass).
-    Unreadable,
+    /// The file was scanned but could not be read. The run fails closed so an
+    /// incremental query never silently retains stale rows for it.
+    Unreadable(std::io::Error),
     /// Parse + extraction ran; `existed` means prior rows must be cleared.
     Index {
         existed: bool,
@@ -398,7 +449,7 @@ fn examine(root: &Path, c: &Candidate, stored: Option<&StoredFile>) -> Outcome {
     }
     let bytes = match std::fs::read(&abs) {
         Ok(b) => b,
-        Err(_) => return Outcome::Unreadable,
+        Err(error) => return Outcome::Unreadable(error),
     };
     let hash = git::blob_hash(&bytes);
     if let Some(f) = stored {
@@ -437,15 +488,22 @@ fn write_file(
         rusqlite::params![rel, service.name, lang.name(), loc, hash, mtime, size, now],
     )?;
 
-    // Insert symbols, remembering (id, start, end) for enclosing resolution.
-    let mut spans: Vec<(i64, usize, usize)> = Vec::with_capacity(extracted.symbols.len());
+    // Establish lexical identities before insertion. These survive database
+    // row-id churn and let edge resolution prefer the source's actual owner.
+    let parents = symbol_parents(&extracted.symbols);
+    let qualified: Vec<String> = (0..extracted.symbols.len())
+        .map(|i| qualified_name(&extracted.symbols, &parents, i))
+        .collect();
+    let mut spans: Vec<IndexedSpan> = Vec::with_capacity(extracted.symbols.len());
     {
         let mut stmt = tx.prepare(
             "INSERT INTO symbols(name, kind, file, start_line, end_line, signature,
-                                 doc_first_line, service, language, is_test)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                 doc_first_line, container, qualified_name,
+                                 service, language, is_test)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )?;
-        for s in &extracted.symbols {
+        for (i, s) in extracted.symbols.iter().enumerate() {
+            let container = parents[i].map(|p| extracted.symbols[p].name.as_str());
             stmt.execute(rusqlite::params![
                 s.name,
                 s.kind,
@@ -454,11 +512,18 @@ fn write_file(
                 s.end_line as i64,
                 s.signature,
                 s.doc_first_line,
+                container,
+                qualified[i],
                 service.name,
                 lang.name(),
                 crate::lang::is_test_symbol(rel, s),
             ])?;
-            spans.push((tx.last_insert_rowid(), s.start_line, s.end_line));
+            spans.push(IndexedSpan {
+                id: tx.last_insert_rowid(),
+                start: s.start_line,
+                end: s.end_line,
+                kind: s.kind.clone(),
+            });
         }
     }
 
@@ -466,23 +531,92 @@ fn write_file(
     // recorded per *file* (even top-level ones with no enclosing symbol):
     // they license cross-service resolution for that name from this file.
     {
-        let mut stmt =
-            tx.prepare("INSERT INTO edge_raw(src_symbol, dst_name, kind) VALUES (?1, ?2, ?3)")?;
+        let mut stmt = tx.prepare(
+            "INSERT INTO edge_raw(src_symbol, dst_name, qualifier, kind)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
         let mut imp =
             tx.prepare("INSERT OR IGNORE INTO file_imports(file, name) VALUES (?1, ?2)")?;
         for e in &extracted.edges {
             if e.kind == "import" {
                 imp.execute(rusqlite::params![rel, e.dst_name])?;
             }
-            if let Some(src_id) = enclosing(&spans, e.src_line) {
-                stmt.execute(rusqlite::params![src_id, e.dst_name, e.kind])?;
+            if let Some(src_id) = edge_owner(&spans, e.src_line, &e.kind) {
+                stmt.execute(rusqlite::params![src_id, e.dst_name, e.qualifier, e.kind])?;
             }
         }
     }
     Ok(())
 }
 
+struct IndexedSpan {
+    id: i64,
+    start: usize,
+    end: usize,
+    kind: String,
+}
+
+fn symbol_parents(symbols: &[crate::lang::RawSymbol]) -> Vec<Option<usize>> {
+    symbols
+        .iter()
+        .enumerate()
+        .map(|(i, child)| {
+            symbols
+                .iter()
+                .enumerate()
+                .filter(|(j, parent)| {
+                    *j != i
+                        && parent.start_line <= child.start_line
+                        && parent.end_line >= child.end_line
+                        && (parent.start_line < child.start_line
+                            || parent.end_line > child.end_line)
+                })
+                .min_by_key(|(_, parent)| parent.end_line - parent.start_line)
+                .map(|(j, _)| j)
+        })
+        .collect()
+}
+
+fn qualified_name(
+    symbols: &[crate::lang::RawSymbol],
+    parents: &[Option<usize>],
+    mut index: usize,
+) -> String {
+    let mut parts = vec![symbols[index].name.as_str()];
+    while let Some(parent) = parents[index] {
+        parts.push(symbols[parent].name.as_str());
+        index = parent;
+    }
+    parts.reverse();
+    parts.join("::")
+}
+
+fn callable_kind(kind: &str) -> bool {
+    matches!(kind, "fn" | "def" | "method" | "function")
+}
+
+/// Calls belong to the innermost callable, not a local `val`/`const` whose
+/// initializer happens to contain them. Non-call edges retain the old
+/// innermost-definition ownership needed by extends/import relationships.
+fn edge_owner(spans: &[IndexedSpan], line: usize, edge_kind: &str) -> Option<i64> {
+    let containing = || {
+        spans
+            .iter()
+            .filter(move |s| s.start <= line && line <= s.end)
+    };
+    if edge_kind == "call" {
+        if let Some(owner) = containing()
+            .filter(|s| callable_kind(&s.kind))
+            .min_by_key(|s| s.end - s.start)
+        {
+            return Some(owner.id);
+        }
+    }
+    containing().min_by_key(|s| s.end - s.start).map(|s| s.id)
+}
+
 /// Innermost symbol whose span contains `line`.
+#[cfg(test)]
 fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
     spans
         .iter()
@@ -505,7 +639,12 @@ fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
 /// * A reference that is neither defined in the source's service nor imported
 ///   is dropped rather than guessed — so we never cross-link `get`/`apply`-
 ///   style common names to unrelated symbols in other services.
-/// * Within a service, a definition in the **same file** wins, then lowest id.
+/// * A bare call first resolves to a sibling in the same lexical container.
+///   Otherwise it resolves only when the same-file or same-service candidate
+///   is unique; ambiguous names are dropped instead of guessed.
+/// * A qualified call resolves only to a definition owned by that qualifier
+///   (`TaxCalculator.withTax` -> `TaxCalculator::withTax`). Instance receivers
+///   without a matching indexed container stay unresolved.
 /// * **Self-edges are excluded** so a symbol is never its own caller (e.g. a
 ///   recursive call, or a method whose body references its own name).
 ///
@@ -522,29 +661,57 @@ fn resolve_edges(tx: &rusqlite::Transaction) -> Result<()> {
         "INSERT INTO edges(src_symbol, dst_symbol, kind)
          SELECT src_symbol, dst, kind FROM (
              SELECT er.src_symbol AS src_symbol, er.kind AS kind,
-                    COALESCE(
-                        -- Same file (always same service), lowest id.
+                    CASE WHEN er.qualifier IS NOT NULL THEN
+                        COALESCE(
+                            (SELECT s.id FROM symbols s
+                              WHERE s.name = er.dst_name
+                                AND s.container = er.qualifier
+                                AND s.file = src.file
+                                AND s.id <> er.src_symbol
+                              ORDER BY s.id LIMIT 1),
+                            (SELECT s.id FROM symbols s
+                              WHERE s.name = er.dst_name
+                                AND s.container = er.qualifier
+                                AND s.service = src.service
+                                AND s.id <> er.src_symbol
+                              ORDER BY s.id LIMIT 1),
+                            (CASE WHEN EXISTS (SELECT 1 FROM file_imports fi
+                                                WHERE fi.file = src.file
+                                                  AND fi.name = er.qualifier)
+                                  THEN (SELECT s.id FROM symbols s
+                                         WHERE s.name = er.dst_name
+                                           AND s.container = er.qualifier
+                                           AND s.id <> er.src_symbol
+                                         ORDER BY s.id LIMIT 1)
+                             END)
+                        )
+                    ELSE COALESCE(
+                        -- A sibling definition in the same lexical owner.
                         (SELECT s.id FROM symbols s
                           WHERE s.file = src.file AND s.name = er.dst_name
+                            AND s.container IS src.container
                             AND s.id <> er.src_symbol
                           ORDER BY s.id LIMIT 1),
-                        -- Same service, lowest id.
-                        (SELECT s.id FROM symbols s
+                        -- Same file, but only when unambiguous.
+                        (SELECT CASE WHEN count(*) = 1 THEN min(s.id) END
+                           FROM symbols s
+                          WHERE s.file = src.file AND s.name = er.dst_name
+                            AND s.id <> er.src_symbol),
+                        -- Same service, but only when unambiguous.
+                        (SELECT CASE WHEN count(*) = 1 THEN min(s.id) END
+                           FROM symbols s
                           WHERE s.name = er.dst_name AND s.service = src.service
-                            AND s.id <> er.src_symbol
-                          ORDER BY s.id LIMIT 1),
-                        -- Imported names may cross services. The CASE gates
-                        -- the candidate scan on the (indexed) import lookup,
-                        -- so unimported unresolvable names cost one probe.
+                            AND s.id <> er.src_symbol),
+                        -- Imported names may cross services when unique.
                         (CASE WHEN EXISTS (SELECT 1 FROM file_imports fi
                                             WHERE fi.file = src.file
                                               AND fi.name = er.dst_name)
-                              THEN (SELECT s.id FROM symbols s
+                              THEN (SELECT CASE WHEN count(*) = 1 THEN min(s.id) END
+                                      FROM symbols s
                                      WHERE s.name = er.dst_name
-                                       AND s.id <> er.src_symbol
-                                     ORDER BY s.id LIMIT 1)
+                                       AND s.id <> er.src_symbol)
                          END)
-                    ) AS dst
+                    ) END AS dst
              FROM edge_raw er
              JOIN symbols src ON src.id = er.src_symbol
          )
@@ -578,9 +745,12 @@ pub fn refresh(conn: &mut Connection, root: &Path, db_file: &Path) -> Result<()>
     let files: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0))?;
     let s = run(conn, root, files > 0, db_file)?;
     if s.files_indexed > 0 || s.files_removed > 0 {
-        eprintln!(
-            "index refreshed: {} files reindexed, {} removed [{}]",
-            s.files_indexed, s.files_removed, s.mode
+        crate::output::note(
+            "index_refreshed",
+            format!(
+                "index refreshed: {} files reindexed, {} removed [{}]",
+                s.files_indexed, s.files_removed, s.mode
+            ),
         );
     }
     Ok(())
@@ -1044,5 +1214,93 @@ mod tests {
             !symbol_exists(&conn, "g"),
             "deleted file's symbols are gone"
         );
+    }
+
+    #[test]
+    fn invalid_root_cannot_erase_an_existing_index() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn kept() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+
+        let missing = dir.path().join("does-not-exist");
+        let error = run(&mut conn, &missing, false, &db_path).unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
+        assert!(symbol_exists(&conn, "kept"));
+    }
+
+    #[test]
+    fn database_is_bound_to_one_canonical_repository() {
+        let first = build_repo(&[("svc/a.rs", "pub fn first() {}\n")]);
+        let second = build_repo(&[("svc/b.rs", "pub fn second() {}\n")]);
+        let (mut conn, db_path) = open_db(&first);
+        run(&mut conn, first.path(), false, &db_path).unwrap();
+
+        let error = run(&mut conn, second.path(), false, &db_path).unwrap_err();
+        assert!(error.to_string().contains("index belongs to repository"));
+        assert!(symbol_exists(&conn, "first"));
+        assert!(!symbol_exists(&conn, "second"));
+    }
+
+    #[test]
+    fn failed_full_rebuild_rolls_back_the_previous_index() {
+        let dir = build_repo(&[("svc/a.rs", "pub fn kept() {}\n")]);
+        let (mut conn, db_path) = open_db(&dir);
+        run(&mut conn, dir.path(), false, &db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER reject_service_delete
+             BEFORE DELETE ON services BEGIN
+               SELECT RAISE(ABORT, 'injected rebuild failure');
+             END;",
+        )
+        .unwrap();
+
+        assert!(run(&mut conn, dir.path(), false, &db_path).is_err());
+        assert!(symbol_exists(&conn, "kept"));
+        assert_eq!(service_names(&conn), vec!["svc"]);
+    }
+
+    #[test]
+    fn qualified_calls_and_callable_ownership_avoid_false_get_edges() {
+        let (conn, _dir) = index_repo(&[(
+            "src/Invoice.scala",
+            "trait Repository[A] {\n  def get(id: String): Option[A]\n}\n\
+             object TaxCalculator {\n  def withTax(n: Long): Long = n\n}\n\
+             object InvoiceService extends Repository[String] {\n\
+               val store = scala.collection.mutable.Map.empty[String, String]\n\
+               def get(id: String): Option[String] = store.get(id)\n\
+               def total(id: String): Long = {\n\
+                 val base = get(id).map(_.length.toLong).getOrElse(0L)\n\
+                 TaxCalculator.withTax(base)\n\
+               }\n\
+             }\n",
+        )]);
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT src.qualified_name, dst.qualified_name
+                 FROM edges e
+                 JOIN symbols src ON src.id = e.src_symbol
+                 JOIN symbols dst ON dst.id = e.dst_symbol
+                 ORDER BY 1, 2",
+            )
+            .unwrap();
+        let edges: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            edges,
+            vec![
+                ("InvoiceService::total".into(), "InvoiceService::get".into()),
+                (
+                    "InvoiceService::total".into(),
+                    "TaxCalculator::withTax".into()
+                ),
+            ]
+        );
+        assert!(!edges
+            .iter()
+            .any(|(src, dst)| { src == "InvoiceService::get" && dst == "Repository::get" }));
     }
 }

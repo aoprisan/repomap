@@ -6,10 +6,10 @@ use rusqlite::Connection;
 /// Bumped whenever the derived-index schema changes shape. The index is a
 /// cache over the working tree, so migration drops and rebuilds those tables;
 /// user-owned lifetime usage data is retained.
-const SCHEMA_VERSION: i32 = 6;
+const SCHEMA_VERSION: i32 = 7;
 
 pub fn open(path: &str) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     // Query commands auto-refresh the index first, so two concurrent repomap
     // invocations (an agent running commands in parallel is the normal case)
     // can hit the database at once. Without a busy timeout the loser gets an
@@ -20,8 +20,10 @@ pub fn open(path: &str) -> Result<Connection> {
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if version != SCHEMA_VERSION {
         // Old (or brand-new) database: wipe any previous-shape tables and
-        // recreate. Dropped child-first so this works even with FKs enforced.
-        conn.execute_batch(
+        // recreate atomically. Dropped child-first so this works even with
+        // foreign keys enabled by a previous connection.
+        let tx = conn.transaction()?;
+        tx.execute_batch(
             "DROP TABLE IF EXISTS symbols_fts;
              DROP TABLE IF EXISTS edges;
              DROP TABLE IF EXISTS edge_raw;
@@ -31,8 +33,9 @@ pub fn open(path: &str) -> Result<Connection> {
              DROP TABLE IF EXISTS services;
              DROP TABLE IF EXISTS meta;",
         )?;
-        conn.execute_batch(SCHEMA)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.execute_batch(SCHEMA)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
     }
 
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -80,6 +83,10 @@ CREATE TABLE IF NOT EXISTS symbols (
   end_line       INTEGER NOT NULL,
   signature      TEXT,
   doc_first_line TEXT,
+  -- Lexical identity derived from containing definitions. `container` is the
+  -- immediate owner; `qualified_name` is stable across reindex row-id churn.
+  container      TEXT,
+  qualified_name TEXT NOT NULL DEFAULT '',
   service        TEXT NOT NULL,
   language       TEXT NOT NULL,
   -- True for test definitions detected from file conventions, symbol names,
@@ -97,12 +104,14 @@ CREATE TABLE IF NOT EXISTS symbols (
 -- prefixes.
 CREATE INDEX IF NOT EXISTS idx_sym_name_service ON symbols(name, service);
 CREATE INDEX IF NOT EXISTS idx_sym_file_name ON symbols(file, name);
+CREATE INDEX IF NOT EXISTS idx_sym_qualified ON symbols(qualified_name, service, file);
 
 -- Best-effort references keyed by dst *name*; resolved into `edges` after
 -- each index run. Cascades away when its source symbol (and file) is dropped.
 CREATE TABLE IF NOT EXISTS edge_raw (
   src_symbol INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
   dst_name   TEXT NOT NULL,
+  qualifier  TEXT,
   kind       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_edgeraw_src ON edge_raw(src_symbol);
@@ -134,17 +143,17 @@ CREATE TABLE IF NOT EXISTS services (
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
-  name, signature, doc_first_line,
+  name, qualified_name, signature, doc_first_line,
   content='symbols', content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-  INSERT INTO symbols_fts(rowid, name, signature, doc_first_line)
-  VALUES (new.id, new.name, new.signature, new.doc_first_line);
+  INSERT INTO symbols_fts(rowid, name, qualified_name, signature, doc_first_line)
+  VALUES (new.id, new.name, new.qualified_name, new.signature, new.doc_first_line);
 END;
 CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-  INSERT INTO symbols_fts(symbols_fts, rowid, name, signature, doc_first_line)
-  VALUES ('delete', old.id, old.name, old.signature, old.doc_first_line);
+  INSERT INTO symbols_fts(symbols_fts, rowid, name, qualified_name, signature, doc_first_line)
+  VALUES ('delete', old.id, old.name, old.qualified_name, old.signature, old.doc_first_line);
 END;
 "#;
 

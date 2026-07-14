@@ -8,6 +8,7 @@
 
 use anyhow::{bail, Result};
 use rusqlite::Connection;
+use serde_json::json;
 
 /// How many seed symbols to consider before budget packing.
 const MAX_SEEDS: usize = 8;
@@ -25,10 +26,19 @@ struct Seed {
 
 pub fn context(conn: &Connection, query: &str, budget: usize) -> Result<usize> {
     let Some((output, shown)) = build_context(conn, query, budget)? else {
-        eprintln!("no matches for '{query}'");
+        crate::output::no_match(format!("no matches for '{query}'"));
         return Ok(0);
     };
-    println!("{output}");
+    crate::output::emit(
+        "context",
+        json!({
+            "query": query,
+            "budget_tokens": budget,
+            "seeds_shown": shown,
+            "content": output,
+        }),
+        &output,
+    );
     Ok(shown)
 }
 

@@ -1,5 +1,6 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
+use crate::output::OutputFormat;
 use crate::skill::Agent;
 
 #[derive(Parser)]
@@ -45,8 +46,35 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_refresh: bool,
 
+    /// If automatic refresh fails, explicitly allow querying the older index.
+    /// The command still reports a distinct stale-result exit status.
+    #[arg(long, global = true, conflicts_with = "no_refresh")]
+    pub allow_stale: bool,
+
+    /// Output contract: compact human text or versioned JSON Lines.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub cmd: Option<Cmd>,
+}
+
+/// Select one or more definitions. A qualified name such as
+/// `InvoiceService::get` may be passed as SYMBOL; filters make repeated names
+/// in large repositories explicit and scriptable.
+#[derive(Args, Clone)]
+pub struct SymbolSelectorArgs {
+    /// Exact bare or qualified symbol name (for example `get` or `InvoiceService::get`).
+    pub symbol: String,
+    /// Restrict the selected definition to one service.
+    #[arg(long)]
+    pub service: Option<String>,
+    /// Restrict by exact repo-relative path or path suffix.
+    #[arg(long)]
+    pub file: Option<String>,
+    /// Restrict by native kind or generic `function`/`module` alias.
+    #[arg(long)]
+    pub kind: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -71,11 +99,20 @@ pub enum Cmd {
         k: usize,
     },
     /// Definition site(s) of a symbol, one line each.
-    Def { symbol: String },
+    Def {
+        #[command(flatten)]
+        selector: SymbolSelectorArgs,
+    },
     /// Symbols with an edge pointing at <symbol>, one line each.
-    Callers { symbol: String },
+    Callers {
+        #[command(flatten)]
+        selector: SymbolSelectorArgs,
+    },
     /// Symbols that <symbol> points at (calls, extends, imports), one line each.
-    Callees { symbol: String },
+    Callees {
+        #[command(flatten)]
+        selector: SymbolSelectorArgs,
+    },
     /// All symbols defined in <file> (exact repo-relative path, or a path
     /// suffix like `Invoice.scala`), in source order.
     Outline { file: String },
@@ -90,7 +127,8 @@ pub enum Cmd {
     /// Blast radius of changing <symbol>: transitive callers up to --depth
     /// hops, nearest and most important first.
     Impact {
-        symbol: String,
+        #[command(flatten)]
+        selector: SymbolSelectorArgs,
         #[arg(long, default_value_t = 2)]
         depth: usize,
         #[arg(short = 'k', default_value_t = 40)]
