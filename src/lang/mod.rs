@@ -8,7 +8,7 @@ mod rust;
 mod scala;
 mod typescript;
 
-pub use extract::Extracted;
+pub use extract::{Extracted, RawSymbol};
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -101,6 +101,32 @@ impl Language {
     pub fn extract(&self, src: &str) -> anyhow::Result<Extracted> {
         extract::extract(src, &self.ts_language(), self.compiled_query())
     }
+}
+
+/// Combine syntax/name hints from extraction with cross-language file naming
+/// conventions. Keeping this in the language layer makes index-time and
+/// working-tree diff analysis agree on what counts as a test.
+pub fn is_test_symbol(path: &str, symbol: &RawSymbol) -> bool {
+    if symbol.is_test_hint {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let conventional_name = matches!(
+        Path::new(path).extension().and_then(|e| e.to_str()),
+        Some("py" | "rb")
+    ) && (symbol.name.to_ascii_lowercase().starts_with("test_")
+        || symbol.name.to_ascii_lowercase().ends_with("_test")
+        || symbol.name.to_ascii_lowercase().starts_with("should_"));
+    lower
+        .split('/')
+        .any(|part| matches!(part, "test" | "tests" | "spec" | "specs" | "__tests__"))
+        || file.starts_with("test_")
+        || file.contains("_test.")
+        || file.contains(".test.")
+        || file.contains("_spec.")
+        || file.contains(".spec.")
+        || conventional_name
 }
 
 #[cfg(test)]
@@ -311,5 +337,34 @@ export function after(): number { return render(1); }
             has_edge(&e, "call", "render"),
             "call edge inside a TSX file"
         );
+    }
+
+    #[test]
+    fn test_detection_combines_annotations_paths_and_language_conventions() {
+        let rust = Language::Rust
+            .extract(
+                "fn helper() { let marker = \"#[test]\"; }\n#[test]\nfn arbitrary_name() {}\nfn after_test() {}\n",
+            )
+            .unwrap();
+        assert!(!is_test_symbol("src/lib.rs", symbol(&rust, "helper")));
+        assert!(is_test_symbol(
+            "src/lib.rs",
+            symbol(&rust, "arbitrary_name")
+        ));
+        assert!(!is_test_symbol("src/lib.rs", symbol(&rust, "after_test")));
+
+        let python = Language::Python
+            .extract("def test_total():\n    pass\ndef helper():\n    pass\n")
+            .unwrap();
+        assert!(is_test_symbol("billing.py", symbol(&python, "test_total")));
+        assert!(!is_test_symbol("billing.py", symbol(&python, "helper")));
+
+        let typescript = Language::Typescript
+            .extract("export function helper() {}\n")
+            .unwrap();
+        assert!(is_test_symbol(
+            "src/widget.test.ts",
+            symbol(&typescript, "helper")
+        ));
     }
 }

@@ -1,3 +1,4 @@
+mod changes;
 mod cli;
 mod context;
 mod db;
@@ -148,6 +149,10 @@ fn main() -> Result<()> {
         Cmd::Context { query, budget } => {
             let results = context::context(&conn, &query, budget)?;
             record_query(&conn, "context", results)?;
+        }
+        Cmd::Changes { base, depth, k } => {
+            let results = changes::run(&conn, &root, &base, depth, k)?;
+            record_query(&conn, "changes", results)?;
         }
         Cmd::Usage { reset } => {
             if reset {

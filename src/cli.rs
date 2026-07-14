@@ -115,6 +115,20 @@ pub enum Cmd {
         #[arg(long, default_value_t = 2000)]
         budget: usize,
     },
+    /// Analyze the working-tree diff as symbols: classify API/body changes,
+    /// trace affected callers (including callers of deleted definitions), and
+    /// select graph-linked tests for review.
+    Changes {
+        /// Git revision to compare the working tree against.
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Maximum caller depth for the review and test surface.
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+        /// Maximum changed/affected/test rows printed per section.
+        #[arg(short = 'k', default_value_t = 30)]
+        k: usize,
+    },
     /// Report lifetime query usage and estimated tokens saved.
     Usage {
         /// Clear all recorded usage statistics.

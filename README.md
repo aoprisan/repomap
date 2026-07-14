@@ -75,6 +75,7 @@ repomap rank                   # most important symbols (PageRank)
 repomap impact InvoiceService  # blast radius of changing a symbol
 repomap cochange billing.rs    # files that historically change with it
 repomap context "tax rounding" # token-budgeted orientation pack for a task
+repomap changes                # semantic diff + review surface + tests to run
 repomap usage                  # lifetime query totals and estimated savings
 ```
 
@@ -311,6 +312,38 @@ The footer reports actual usage; when seeds are cut for budget it says so
 with an error and reports the minimum required budget instead of overflowing
 the requested limit.
 
+### `changes [--base REV] [--depth N] [-k N]`
+
+Turns the working-tree diff into a compact **semantic review plan**. Instead
+of listing changed lines, it compares Tree-sitter symbols with `REV` (default
+`HEAD`) and classifies additions, deletions, signature changes, body changes,
+documentation changes, renames, and edits outside symbol bodies. It then
+walks the reference graph outward to show the review surface and select tests
+that transitively exercise the changed symbols:
+
+```
+$ repomap changes --depth 3
+changes vs HEAD: 2 files, 3 semantic changes
+changed:
+src/api.rs:L8  pub fn charge(...)  [billing]  (signature, high, public API, 7 direct refs, cross-service)
+review surface:
+src/checkout.rs:L41  fn submit(...)  [checkout]  (depth 1, via charge)
+tests to run:
+tests/checkout_test.rs:L12  fn rejects_expired_card()  [checkout]  (depth 2, via charge)
+change risk: high (8 affected symbols across 2 services; 3 linked tests)
+```
+
+This deliberately works for **deleted definitions** too. Although a deleted
+symbol is absent from the refreshed live index, `changes` scopes unresolved
+raw references with the same conservative service/import rules as normal edge
+resolution, recovers its direct callers, and continues through the current
+graph. Test detection combines language annotations/decorators, test file
+conventions, and framework naming conventions. Untracked and non-indexed
+files are included rather than silently disappearing.
+
+`changes` is deterministic and local: it invokes `git diff`/`git show`, parses
+both sides locally, and sends no source or diff to a model or service.
+
 ### `usage [--reset]`
 
 Reports successful query invocations, returned results, and a conservative
@@ -362,6 +395,10 @@ misattributes them to a sibling service.
   symbol; `rank` reads it directly and `find`/`def` use it as a tie-breaker.
   `impact` BFS-walks the same graph in reverse; `cochange` is independent of
   the graph — it mines `git log` at query time.
+- **Change intelligence** — `changes` extracts symbols from the Git base and
+  working tree, fingerprints definitions with nested bodies excluded, joins
+  the semantic diff to resolved and unresolved references, and walks outward
+  to produce a prioritized review and test surface.
 - **Incremental** — a file is skipped when its stat (mtime + size) is
   untouched, or — when the stat moved — its git blob hash (pure-Rust,
   `git hash-object`-compatible) still matches. Query commands run an
