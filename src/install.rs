@@ -54,7 +54,10 @@ pub fn install() -> anyhow::Result<()> {
 /// replace a binary that is currently running. `fs::copy` carries the source's
 /// mode bits across, so the installed file stays executable.
 fn copy_binary(source: &Path, dest: &Path) -> anyhow::Result<()> {
-    let stem = dest.file_name().and_then(OsStr::to_str).unwrap_or("repomap");
+    let stem = dest
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or("repomap");
     let tmp = dest.with_file_name(format!("{stem}.install-tmp"));
     fs::copy(source, &tmp)
         .with_context(|| format!("copying {} to {}", source.display(), tmp.display()))?;
@@ -65,7 +68,11 @@ fn copy_binary(source: &Path, dest: &Path) -> anyhow::Result<()> {
 /// Pick a destination bin directory: the first conventional user bin dir that is
 /// already on `$PATH` (so the install works immediately), else `~/.local/bin`.
 fn choose_install_dir(home: &Path, path_var: &OsStr) -> PathBuf {
-    let preferred = [home.join(".local/bin"), home.join("bin"), home.join(".cargo/bin")];
+    let preferred = [
+        home.join(".local/bin"),
+        home.join("bin"),
+        home.join(".cargo/bin"),
+    ];
     for dir in &preferred {
         if path_contains(path_var, dir) {
             return dir.clone();
@@ -109,7 +116,10 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .any(|e| e.file_name().to_string_lossy().contains("install-tmp"));
-        assert!(!leftover_tmp, "temp file should be renamed away, not left behind");
+        assert!(
+            !leftover_tmp,
+            "temp file should be renamed away, not left behind"
+        );
     }
 
     #[test]
@@ -118,13 +128,19 @@ mod tests {
         let path_var =
             env::join_paths([PathBuf::from("/usr/bin"), home.join(".cargo/bin")]).unwrap();
         // ~/.local/bin and ~/bin are absent from PATH, so ~/.cargo/bin wins.
-        assert_eq!(choose_install_dir(&home, &path_var), home.join(".cargo/bin"));
+        assert_eq!(
+            choose_install_dir(&home, &path_var),
+            home.join(".cargo/bin")
+        );
     }
 
     #[test]
     fn falls_back_to_local_bin_when_none_on_path() {
         let home = PathBuf::from("/home/dev");
         let path_var = env::join_paths([PathBuf::from("/usr/bin")]).unwrap();
-        assert_eq!(choose_install_dir(&home, &path_var), home.join(".local/bin"));
+        assert_eq!(
+            choose_install_dir(&home, &path_var),
+            home.join(".local/bin")
+        );
     }
 }

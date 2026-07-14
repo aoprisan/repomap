@@ -97,7 +97,10 @@ impl Resolver {
         };
         // Longest path first so nested services win the prefix match.
         services.sort_by_key(|s| std::cmp::Reverse(s.path.len()));
-        Resolver { services, synthetic_root }
+        Resolver {
+            services,
+            synthetic_root,
+        }
     }
 
     /// The synthetic catch-all's name, if one was appended.
@@ -126,7 +129,9 @@ impl Resolver {
     /// Return the owning service for a repo-relative path.
     pub fn resolve(&self, rel: &str) -> &Service {
         for s in &self.services {
-            if s.path == "." || s.path.is_empty() || rel == s.path
+            if s.path == "."
+                || s.path.is_empty()
+                || rel == s.path
                 || rel.starts_with(&format!("{}/", s.path))
             {
                 return s;
@@ -183,7 +188,11 @@ mod tests {
 
     #[test]
     fn longest_prefix_wins_and_declared_root_suppresses_the_synthetic() {
-        let r = Resolver::new(vec![svc("outer", "a"), svc("inner", "a/b"), svc("all", ".")]);
+        let r = Resolver::new(vec![
+            svc("outer", "a"),
+            svc("inner", "a/b"),
+            svc("all", "."),
+        ]);
         assert_eq!(r.resolve("a/b/x.rs").name, "inner");
         assert_eq!(r.resolve("a/x.rs").name, "outer");
         assert_eq!(r.resolve("elsewhere.rs").name, "all");

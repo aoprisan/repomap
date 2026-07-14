@@ -28,7 +28,10 @@ impl Pointer {
         } else {
             &self.signature
         };
-        format!("{}:L{}  {}  [{}]{}", self.file, self.start_line, sig, enc, suffix)
+        format!(
+            "{}:L{}  {}  [{}]{}",
+            self.file, self.start_line, sig, enc, suffix
+        )
     }
 
     fn print(&self, suffix: &str) {
@@ -81,7 +84,7 @@ fn kind_synonyms(kind: &str) -> Vec<&str> {
     kinds
 }
 
-pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
+pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<usize> {
     let mut sql = format!(
         "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}
@@ -118,18 +121,18 @@ pub fn find(conn: &Connection, query: &str, opts: &FindOpts) -> Result<()> {
     let rows = stmt.query_map(pref.as_slice(), |r| {
         Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
-    let mut any = false;
+    let mut count = 0;
     for p in rows {
         p?.print("");
-        any = true;
+        count += 1;
     }
-    if !any {
+    if count == 0 {
         eprintln!("no matches");
     }
-    Ok(())
+    Ok(count)
 }
 
-pub fn def(conn: &Connection, symbol: &str) -> Result<()> {
+pub fn def(conn: &Connection, symbol: &str) -> Result<usize> {
     let sql = format!(
         "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}
@@ -141,18 +144,18 @@ pub fn def(conn: &Connection, symbol: &str) -> Result<()> {
     let rows = stmt.query_map([symbol], |r| {
         Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
     })?;
-    let mut any = false;
+    let mut count = 0;
     for p in rows {
         p?.print("");
-        any = true;
+        count += 1;
     }
-    if !any {
+    if count == 0 {
         eprintln!("no definition for '{symbol}'");
     }
-    Ok(())
+    Ok(count)
 }
 
-pub fn callers(conn: &Connection, symbol: &str) -> Result<()> {
+pub fn callers(conn: &Connection, symbol: &str) -> Result<usize> {
     // Callers = source symbols of edges whose dst is a symbol named `symbol`.
     let sql = format!(
         "SELECT s.file, s.start_line, s.signature,
@@ -172,19 +175,19 @@ pub fn callers(conn: &Connection, symbol: &str) -> Result<()> {
             kind,
         ))
     })?;
-    let mut any = false;
+    let mut count = 0;
     for row in rows {
         let (p, kind) = row?;
         p.print(&format!("  ({kind})"));
-        any = true;
+        count += 1;
     }
-    if !any {
+    if count == 0 {
         eprintln!("no callers for '{symbol}'");
     }
-    Ok(())
+    Ok(count)
 }
 
-pub fn callees(conn: &Connection, symbol: &str) -> Result<()> {
+pub fn callees(conn: &Connection, symbol: &str) -> Result<usize> {
     // Callees = destination symbols of edges whose src is named `symbol`.
     let enclosing_d = enclosing_sql("d");
     let sql = format!(
@@ -205,23 +208,23 @@ pub fn callees(conn: &Connection, symbol: &str) -> Result<()> {
             kind,
         ))
     })?;
-    let mut any = false;
+    let mut count = 0;
     for row in rows {
         let (p, kind) = row?;
         p.print(&format!("  ({kind})"));
-        any = true;
+        count += 1;
     }
-    if !any {
+    if count == 0 {
         eprintln!("no callees for '{symbol}'");
     }
-    Ok(())
+    Ok(count)
 }
 
 /// Structurally most important symbols, by PageRank over the reference graph.
 /// The score is normalized so the top symbol in scope is 100 — comparable
 /// within one invocation, not across repos. Orientation: run this (optionally
 /// per service) to learn what a codebase actually revolves around.
-pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<()> {
+pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<usize> {
     let mut sql = format!(
         "SELECT s.file, s.start_line, s.signature,
                 {ENCLOSING_SQL}, s.rank, {INDEG_SQL}
@@ -232,7 +235,9 @@ pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<()> {
         params.push(Box::new(v.to_string()));
         sql.push_str(" WHERE s.service = ?1");
     }
-    sql.push_str(&format!(" ORDER BY s.rank DESC, s.file, s.start_line LIMIT {k}"));
+    sql.push_str(&format!(
+        " ORDER BY s.rank DESC, s.file, s.start_line LIMIT {k}"
+    ));
 
     let mut stmt = conn.prepare(&sql)?;
     let pref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
@@ -247,19 +252,23 @@ pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<()> {
     let max = results.iter().map(|(_, r, _)| *r).fold(0.0f64, f64::max);
     if results.is_empty() || max <= 0.0 {
         eprintln!("no ranked symbols (index empty, or no references resolved yet)");
-        return Ok(());
+        return Ok(0);
     }
     for (p, r, indeg) in &results {
         let score = r / max * 100.0;
-        let callers = if *indeg == 1 { "1 caller".into() } else { format!("{indeg} callers") };
+        let callers = if *indeg == 1 {
+            "1 caller".into()
+        } else {
+            format!("{indeg} callers")
+        };
         p.print(&format!("  (score {score:.0}, {callers})"));
     }
-    Ok(())
+    Ok(results.len())
 }
 
 /// Transitive blast radius of changing `symbol`: its callers, their callers,
 /// and so on up to `depth` hops, most important first within each hop.
-pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result<()> {
+pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result<usize> {
     let reached = crate::graph::impact(conn, symbol, depth)?;
     if reached.is_empty() {
         let defined: i64 = conn.query_row(
@@ -272,7 +281,7 @@ pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result
         } else {
             eprintln!("no impact: nothing references '{symbol}'");
         }
-        return Ok(());
+        return Ok(0);
     }
 
     // Pull pointer rows for every reached symbol, then order by (depth, rank
@@ -296,13 +305,14 @@ pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result
     rows.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| (a.0.file.as_str(), a.0.start_line).cmp(&(b.0.file.as_str(), b.0.start_line)))
+            .then_with(|| {
+                (a.0.file.as_str(), a.0.start_line).cmp(&(b.0.file.as_str(), b.0.start_line))
+            })
     });
 
     let files: std::collections::HashSet<&str> =
         rows.iter().map(|(p, ..)| p.file.as_str()).collect();
-    let services: std::collections::HashSet<&str> =
-        rows.iter().map(|(.., s)| s.as_str()).collect();
+    let services: std::collections::HashSet<&str> = rows.iter().map(|(.., s)| s.as_str()).collect();
     let total = rows.len();
     for (p, d, ..) in rows.iter().take(k) {
         p.print(&format!("  (depth {d})"));
@@ -315,10 +325,10 @@ pub fn impact(conn: &Connection, symbol: &str, depth: usize, k: usize) -> Result
         files.len(),
         services.len()
     );
-    Ok(())
+    Ok(total.min(k))
 }
 
-pub fn outline(conn: &Connection, file: &str) -> Result<()> {
+pub fn outline(conn: &Connection, file: &str) -> Result<usize> {
     // Exact repo-relative path first; fall back to a suffix match so
     // `outline Invoice.scala` works without spelling the full path.
     let base = format!(
@@ -334,20 +344,20 @@ pub fn outline(conn: &Connection, file: &str) -> Result<()> {
         let rows = stmt.query_map([file], |r| {
             Ok(row_to_pointer(r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?;
-        let mut any = false;
+        let mut count = 0;
         for p in rows {
             p?.print("");
-            any = true;
+            count += 1;
         }
-        if any {
-            return Ok(());
+        if count > 0 {
+            return Ok(count);
         }
     }
     eprintln!("no symbols for '{file}' (not indexed, or no definitions in it)");
-    Ok(())
+    Ok(0)
 }
 
-pub fn map(conn: &Connection) -> Result<()> {
+pub fn map(conn: &Connection) -> Result<usize> {
     let mut stmt = conn.prepare(
         "SELECT sv.name, sv.stack, sv.entrypoints,
                 (SELECT count(*) FROM files f WHERE f.service = sv.name)
@@ -361,14 +371,16 @@ pub fn map(conn: &Connection) -> Result<()> {
         let nfiles: i64 = r.get(3)?;
         Ok((name, stack, entrypoints, nfiles))
     })?;
+    let mut count = 0;
     for row in rows {
         let (name, stack, entrypoints, nfiles) = row?;
         let stack = stack.unwrap_or_else(|| "?".into());
-        let entry = first_json_item(entrypoints.as_deref().unwrap_or("[]"))
-            .unwrap_or_else(|| "-".into());
+        let entry =
+            first_json_item(entrypoints.as_deref().unwrap_or("[]")).unwrap_or_else(|| "-".into());
         println!("{name}  ({stack})  {nfiles} files  {entry}");
+        count += 1;
     }
-    Ok(())
+    Ok(count)
 }
 
 /// Report the index database in use: its path, and — if it exists — size and
@@ -398,6 +410,9 @@ pub fn show_db(path: &str) -> Result<()> {
     println!("  files     {}", count("files"));
     println!("  symbols   {}", count("symbols"));
     println!("  edges     {}", count("edges"));
+    if let Some(summary) = crate::usage::summary_line(&conn) {
+        println!("  usage     {summary}");
+    }
     match indexed_at {
         Some(ts) => println!("  indexed   {ts} (epoch seconds)"),
         None => println!("  indexed   never"),
@@ -441,7 +456,10 @@ fn fts_terms(q: &str) -> Vec<String> {
     let terms: Vec<String> = q
         .split_whitespace()
         .map(|t| {
-            let clean: String = t.chars().filter(|c| c.is_alphanumeric() || *c == '_').collect();
+            let clean: String = t
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
             clean
         })
         .filter(|t| !t.is_empty())
@@ -517,14 +535,20 @@ mod tests {
 
     #[test]
     fn fts_query_any_ors_terms_for_task_shaped_text() {
-        assert_eq!(fts_query_any("edge resolution"), "\"edge\"* OR \"resolution\"*");
+        assert_eq!(
+            fts_query_any("edge resolution"),
+            "\"edge\"* OR \"resolution\"*"
+        );
         assert_eq!(fts_query_any("one"), "\"one\"*");
         assert_eq!(fts_query_any(""), "\"\"");
     }
 
     #[test]
     fn kind_synonyms_expands_generic_kinds_and_passes_native_through() {
-        assert_eq!(kind_synonyms("function"), vec!["function", "fn", "def", "method"]);
+        assert_eq!(
+            kind_synonyms("function"),
+            vec!["function", "fn", "def", "method"]
+        );
         assert_eq!(kind_synonyms("fn"), vec!["fn", "function"]);
         assert_eq!(kind_synonyms("module"), vec!["module", "mod"]);
         assert_eq!(kind_synonyms("struct"), vec!["struct"]);
@@ -532,7 +556,10 @@ mod tests {
 
     #[test]
     fn first_json_item_reads_the_leading_element() {
-        assert_eq!(first_json_item(r#"["Main.scala","b"]"#).as_deref(), Some("Main.scala"));
+        assert_eq!(
+            first_json_item(r#"["Main.scala","b"]"#).as_deref(),
+            Some("Main.scala")
+        );
         assert_eq!(first_json_item("[]"), None);
         assert_eq!(first_json_item("not json"), None);
     }

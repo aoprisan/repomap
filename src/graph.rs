@@ -50,8 +50,7 @@ pub fn pagerank(n: usize, edges: &[(usize, usize)]) -> Vec<f64> {
 }
 
 /// Compute PageRank over the `edges` table and persist it into
-/// `symbols.rank`. Called at the end of every index run (edges are rebuilt
-/// from scratch each run, so ranks always match the current graph).
+/// `symbols.rank`. Called whenever an index run changes the symbol graph.
 pub fn compute_ranks(conn: &Connection) -> Result<()> {
     let ids: Vec<i64> = {
         let mut stmt = conn.prepare("SELECT id FROM symbols ORDER BY id")?;
@@ -61,8 +60,7 @@ pub fn compute_ranks(conn: &Connection) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
-    let index_of: HashMap<i64, usize> =
-        ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let index_of: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
     let edges: Vec<(usize, usize)> = {
         let mut stmt = conn.prepare("SELECT src_symbol, dst_symbol FROM edges")?;
@@ -136,8 +134,14 @@ mod tests {
         // 0 -> 2, 1 -> 2: node 2 is the popular one.
         let r = pagerank(3, &[(0, 2), (1, 2)]);
         let total: f64 = r.iter().sum();
-        assert!((total - 1.0).abs() < 1e-6, "ranks must sum to 1, got {total}");
-        assert!(r[2] > r[0] && r[2] > r[1], "referenced node must outrank referencers: {r:?}");
+        assert!(
+            (total - 1.0).abs() < 1e-6,
+            "ranks must sum to 1, got {total}"
+        );
+        assert!(
+            r[2] > r[0] && r[2] > r[1],
+            "referenced node must outrank referencers: {r:?}"
+        );
     }
 
     #[test]
@@ -147,8 +151,14 @@ mod tests {
         // though it has fewer direct referencers than 1 — the property raw
         // in-degree cannot express.
         let r = pagerank(4, &[(0, 1), (1, 2), (3, 1)]);
-        assert!(r[1] > r[0] && r[1] > r[3], "referenced node outranks leaves: {r:?}");
-        assert!(r[2] > r[0] && r[2] > r[3], "importance flows through the chain: {r:?}");
+        assert!(
+            r[1] > r[0] && r[1] > r[3],
+            "referenced node outranks leaves: {r:?}"
+        );
+        assert!(
+            r[2] > r[0] && r[2] > r[3],
+            "importance flows through the chain: {r:?}"
+        );
     }
 
     #[test]
@@ -181,8 +191,10 @@ mod tests {
     }
 
     fn rank_of(conn: &rusqlite::Connection, name: &str) -> f64 {
-        conn.query_row("SELECT rank FROM symbols WHERE name = ?1", [name], |r| r.get(0))
-            .unwrap()
+        conn.query_row("SELECT rank FROM symbols WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })
+        .unwrap()
     }
 
     #[test]

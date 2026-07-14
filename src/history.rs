@@ -20,7 +20,13 @@ const MAX_COMMIT_FILES: usize = 30;
 /// Marker separating commits in the mined log. \x01 never appears in paths.
 const COMMIT_MARK: &str = "\x01";
 
-pub fn cochange(conn: &Connection, root: &Path, file: &str, commits: usize, k: usize) -> Result<()> {
+pub fn cochange(
+    conn: &Connection,
+    root: &Path,
+    file: &str,
+    commits: usize,
+    k: usize,
+) -> Result<usize> {
     let target = resolve_target(conn, root, file)?;
     let log = git_log(root, commits)?;
     let parsed = parse_log(&log);
@@ -32,7 +38,7 @@ pub fn cochange(conn: &Connection, root: &Path, file: &str, commits: usize, k: u
             parsed.len(),
             commits
         );
-        return Ok(());
+        return Ok(0);
     }
 
     // Drop partners that no longer exist in the working tree — coupling to a
@@ -45,13 +51,13 @@ pub fn cochange(conn: &Connection, root: &Path, file: &str, commits: usize, k: u
 
     if rows.is_empty() {
         eprintln!("no co-change partners for '{target}' ({target_commits} commits mined)");
-        return Ok(());
+        return Ok(0);
     }
     for (path, together) in rows.iter().take(k) {
         let pct = *together as f64 / target_commits as f64 * 100.0;
         println!("{path}  {together}/{target_commits} commits ({pct:.0}%)");
     }
-    Ok(())
+    Ok(rows.len().min(k))
 }
 
 /// Resolve the user's file argument to one repo-relative path: exact indexed
@@ -59,12 +65,15 @@ pub fn cochange(conn: &Connection, root: &Path, file: &str, commits: usize, k: u
 /// that co-change is still useful for — a path that simply exists on disk.
 fn resolve_target(conn: &Connection, root: &Path, file: &str) -> Result<String> {
     let exact: Option<String> = conn
-        .query_row("SELECT path FROM files WHERE path = ?1", [file], |r| r.get(0))
+        .query_row("SELECT path FROM files WHERE path = ?1", [file], |r| {
+            r.get(0)
+        })
         .ok();
     if let Some(p) = exact {
         return Ok(p);
     }
-    let mut stmt = conn.prepare("SELECT path FROM files WHERE path LIKE '%' || ?1 ORDER BY path")?;
+    let mut stmt =
+        conn.prepare("SELECT path FROM files WHERE path LIKE '%' || ?1 ORDER BY path")?;
     let matches: Vec<String> = stmt
         .query_map([file], |r| r.get(0))?
         .filter_map(|r| r.ok())
@@ -93,9 +102,14 @@ fn git_log(root: &Path, commits: usize) -> Result<String> {
             "log",
             "--name-only",
             "--no-merges",
+            // Keep paths in the same coordinate system as the index when
+            // `--root` points below the repository top level.
+            "--relative",
             &format!("--pretty=format:{COMMIT_MARK}"),
             "-n",
             &commits.to_string(),
+            "--",
+            ".",
         ])
         .output();
     let out = match out {
@@ -165,7 +179,10 @@ mod tests {
         let log = "\x01\na.rs\nb.rs\n\n\x01\na.rs\n";
         assert_eq!(
             parse_log(log),
-            vec![vec!["a.rs".to_string(), "b.rs".to_string()], vec!["a.rs".to_string()]]
+            vec![
+                vec!["a.rs".to_string(), "b.rs".to_string()],
+                vec!["a.rs".to_string()]
+            ]
         );
     }
 
@@ -192,12 +209,17 @@ mod tests {
 
     #[test]
     fn couple_skips_bulk_commits() {
-        let big: Vec<String> = (0..MAX_COMMIT_FILES + 1).map(|i| format!("f{i}.rs")).collect();
+        let big: Vec<String> = (0..MAX_COMMIT_FILES + 1)
+            .map(|i| format!("f{i}.rs"))
+            .collect();
         let mut cs = vec![big.clone()];
         cs[0].push("a.rs".into());
         cs.push(vec!["a.rs".into(), "b.rs".into()]);
         let (n, counts) = couple(&cs, "a.rs");
-        assert_eq!(n, 1, "the bulk commit is ignored even though it touches the target");
+        assert_eq!(
+            n, 1,
+            "the bulk commit is ignored even though it touches the target"
+        );
         assert_eq!(counts.get("f0.rs"), None);
         assert_eq!(counts.get("b.rs"), Some(&1));
     }
@@ -223,7 +245,11 @@ mod tests {
                 .env("GIT_COMMITTER_EMAIL", "t@t")
                 .output()
                 .unwrap();
-            assert!(ok.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&ok.stderr));
+            assert!(
+                ok.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&ok.stderr)
+            );
         };
         git(&["init", "-q"]);
         // Commit 1: a + b together. Commit 2: a alone. Commit 3: b alone.
@@ -241,6 +267,20 @@ mod tests {
         assert_eq!(parsed.len(), 3);
         let (n, counts) = couple(&parsed, "a.rs");
         assert_eq!(n, 2);
+        assert_eq!(counts.get("b.rs"), Some(&1));
+
+        // When indexing a subtree, git paths must be relative to that same
+        // subtree rather than to the repository top level.
+        std::fs::create_dir(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/a.rs"), "pub fn nested_a() {}\n").unwrap();
+        std::fs::write(root.join("nested/b.rs"), "pub fn nested_b() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "nested"]);
+
+        let nested = parse_log(&git_log(&root.join("nested"), 100).unwrap());
+        assert_eq!(nested, vec![vec!["a.rs".to_string(), "b.rs".to_string()]]);
+        let (n, counts) = couple(&nested, "a.rs");
+        assert_eq!(n, 1);
         assert_eq!(counts.get("b.rs"), Some(&1));
     }
 

@@ -53,7 +53,12 @@ pub struct Summary {
     pub mode: &'static str,
 }
 
-pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path) -> Result<Summary> {
+pub fn run(
+    conn: &mut Connection,
+    root: &Path,
+    incremental: bool,
+    db_file: &Path,
+) -> Result<Summary> {
     let candidates = scan(root, db_file);
     let resolver = build_services(root, &candidates)?;
 
@@ -67,9 +72,11 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
     let mut mode = if incremental { "incremental" } else { "full" };
     if incremental {
         let stored: Option<String> = conn
-            .query_row("SELECT value FROM meta WHERE key = 'services_fingerprint'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'services_fingerprint'",
+                [],
+                |r| r.get(0),
+            )
             .ok();
         if stored.as_deref() != Some(fingerprint.as_str()) {
             incremental = false;
@@ -97,7 +104,11 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                StoredFile { hash: r.get(1)?, mtime: r.get(2)?, size: r.get(3)? },
+                StoredFile {
+                    hash: r.get(1)?,
+                    mtime: r.get(2)?,
+                    size: r.get(3)?,
+                },
             ))
         })?;
         rows.filter_map(|r| r.ok()).collect()
@@ -142,14 +153,30 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
                 skipped += 1;
             }
             Outcome::Unreadable => {}
-            Outcome::Index { existed, loc, hash, mtime, size, extracted } => {
+            Outcome::Index {
+                existed,
+                loc,
+                hash,
+                mtime,
+                size,
+                extracted,
+            } => {
                 if existed {
                     // Clear the file's prior rows (cascades symbols/edges).
                     tx.execute("DELETE FROM files WHERE path = ?1", [&c.rel])?;
                 }
                 let service = resolver.resolve(&c.rel);
                 write_file(
-                    &tx, &c.rel, c.lang, service, loc, &extracted?, &hash, mtime, size, now,
+                    &tx,
+                    &c.rel,
+                    c.lang,
+                    service,
+                    loc,
+                    &extracted?,
+                    &hash,
+                    mtime,
+                    size,
+                    now,
                 )?;
                 indexed += 1;
             }
@@ -173,10 +200,15 @@ pub fn run(conn: &mut Connection, root: &Path, incremental: bool, db_file: &Path
         }
     }
 
-    bar.set_message("resolving edges…");
-    resolve_edges(&tx)?;
-    // Edges were just rebuilt from scratch, so recompute importance to match.
-    crate::graph::compute_ranks(&tx)?;
+    // Unchanged incremental runs preserve both tables. Query commands invoke
+    // refresh before every read, so rebuilding the entire graph here would
+    // turn even a no-op query into up to 50 edge scans plus one write per
+    // symbol.
+    if !incremental || indexed > 0 || removed > 0 {
+        bar.set_message("resolving edges…");
+        resolve_edges(&tx)?;
+        crate::graph::compute_ranks(&tx)?;
+    }
 
     // The synthetic catch-all only earns a row if a file actually landed in
     // it; otherwise drop it so `map` shows only real services.
@@ -257,7 +289,11 @@ fn scan(root: &Path, db_file: &Path) -> Vec<Candidate> {
         if path == db_file {
             continue;
         }
-        if entry.metadata().map(|m| m.len() > MAX_FILE_SIZE).unwrap_or(false) {
+        if entry
+            .metadata()
+            .map(|m| m.len() > MAX_FILE_SIZE)
+            .unwrap_or(false)
+        {
             continue;
         }
         if let Some(lang) = Language::from_path(path) {
@@ -431,9 +467,8 @@ fn write_file(
     {
         let mut stmt =
             tx.prepare("INSERT INTO edge_raw(src_symbol, dst_name, kind) VALUES (?1, ?2, ?3)")?;
-        let mut imp = tx.prepare(
-            "INSERT OR IGNORE INTO file_imports(file, name) VALUES (?1, ?2)",
-        )?;
+        let mut imp =
+            tx.prepare("INSERT OR IGNORE INTO file_imports(file, name) VALUES (?1, ?2)")?;
         for e in &extracted.edges {
             if e.kind == "import" {
                 imp.execute(rusqlite::params![rel, e.dst_name])?;
@@ -558,7 +593,7 @@ fn json_list(items: &[String]) -> String {
     format!("[{}]", quoted.join(","))
 }
 
-fn epoch_secs() -> i64 {
+pub(crate) fn epoch_secs() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -673,7 +708,10 @@ mod tests {
         // `target` is defined in both files of the same service; the caller's
         // own file should win the tie.
         let (conn, _dir) = index_repo(&[
-            ("svc/a.rs", "pub fn caller() { target(); }\npub fn target() {}\n"),
+            (
+                "svc/a.rs",
+                "pub fn caller() { target(); }\npub fn target() {}\n",
+            ),
             ("svc/b.rs", "pub fn target() {}\n"),
         ]);
         assert_eq!(dst_file_of(&conn, "caller").as_deref(), Some("svc/a.rs"));
@@ -708,15 +746,32 @@ mod tests {
         let s1 = run(&mut conn, dir.path(), false, &db_path).unwrap();
         assert_eq!(s1.files_indexed, 1);
 
+        // A no-change refresh must not rewrite the graph or its ranks.
+        conn.execute("UPDATE symbols SET rank = 0.123", []).unwrap();
+
         let s2 = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s2.files_indexed, 0);
         assert_eq!(s2.files_skipped, 1);
+        let preserved: f64 = conn
+            .query_row("SELECT rank FROM symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(preserved, 0.123);
 
-        std::fs::write(dir.path().join("svc/a.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("svc/a.rs"),
+            "pub fn f() {}\npub fn g() {}\n",
+        )
+        .unwrap();
         let s3 = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s3.files_indexed, 1);
         assert_eq!(s3.files_skipped, 0);
         assert!(symbol_exists(&conn, "g"));
+        let stale: i64 = conn
+            .query_row("SELECT count(*) FROM symbols WHERE rank = 0.123", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stale, 0, "a changed graph must recompute ranks");
     }
 
     fn service_of(conn: &Connection, symbol: &str) -> String {
@@ -729,7 +784,9 @@ mod tests {
     }
 
     fn service_names(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn.prepare("SELECT name FROM services ORDER BY name").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM services ORDER BY name")
+            .unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
         rows.filter_map(|r| r.ok()).collect()
     }
@@ -748,7 +805,10 @@ mod tests {
     #[test]
     fn manifest_gap_files_land_in_root_not_a_sibling_service() {
         let (conn, _dir) = index_repo(&[
-            ("repomap.toml", "[[service]]\nname = \"svc\"\npath = \"svc\"\n"),
+            (
+                "repomap.toml",
+                "[[service]]\nname = \"svc\"\npath = \"svc\"\n",
+            ),
             ("svc/a.rs", "pub fn covered() {}\n"),
             ("toplevel.rs", "pub fn orphan() {}\n"),
         ]);
@@ -760,7 +820,10 @@ mod tests {
     #[test]
     fn unused_synthetic_root_is_dropped_from_services() {
         let (conn, _dir) = index_repo(&[
-            ("repomap.toml", "[[service]]\nname = \"svc\"\npath = \"svc\"\n"),
+            (
+                "repomap.toml",
+                "[[service]]\nname = \"svc\"\npath = \"svc\"\n",
+            ),
             ("svc/a.rs", "pub fn covered() {}\n"),
         ]);
         assert_eq!(service_names(&conn), vec!["svc"]);
@@ -787,9 +850,15 @@ mod tests {
         .unwrap();
         let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s.mode, "full: service definitions changed");
-        assert_eq!(s.files_skipped, 0, "no file may be skipped with stale services");
+        assert_eq!(
+            s.files_skipped, 0,
+            "no file may be skipped with stale services"
+        );
         assert_eq!(service_of(&conn, "f"), "everything");
-        assert!(edge_exists(&conn, "f", "g"), "same-service call now resolves");
+        assert!(
+            edge_exists(&conn, "f", "g"),
+            "same-service call now resolves"
+        );
 
         // With the manifest unchanged, incremental stays incremental.
         let s2 = run(&mut conn, dir.path(), true, &db_path).unwrap();
@@ -802,7 +871,10 @@ mod tests {
         // Same layout as drops_cross_service_references, but svca explicitly
         // imports `helper` — that evidence lets the edge cross the boundary.
         let (conn, _dir) = index_repo(&[
-            ("svca/a.rs", "use svcb::helper;\npub fn caller() { helper(); }\n"),
+            (
+                "svca/a.rs",
+                "use svcb::helper;\npub fn caller() { helper(); }\n",
+            ),
             ("svcb/b.rs", "pub fn helper() {}\n"),
         ]);
         assert!(
@@ -831,7 +903,10 @@ mod tests {
         // The conservative default survives: importing one name does not open
         // the door for every other bare reference in the file.
         let (conn, _dir) = index_repo(&[
-            ("svca/a.rs", "use svcb::other;\npub fn caller() { helper(); }\n"),
+            (
+                "svca/a.rs",
+                "use svcb::other;\npub fn caller() { helper(); }\n",
+            ),
             ("svcb/b.rs", "pub fn helper() {}\npub fn other() {}\n"),
         ]);
         assert!(!edge_exists(&conn, "caller", "helper"));
@@ -847,7 +922,11 @@ mod tests {
         assert!(symbol_exists(&conn, "f"));
 
         // Edit a file: the next refresh (incremental) sees it.
-        std::fs::write(dir.path().join("svc/a.rs"), "pub fn f() {}\npub fn g() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("svc/a.rs"),
+            "pub fn f() {}\npub fn g() {}\n",
+        )
+        .unwrap();
         refresh(&mut conn, dir.path(), &db_path).unwrap();
         assert!(symbol_exists(&conn, "g"));
 
@@ -889,8 +968,14 @@ mod tests {
             ("gen/b.rs", "pub fn generated() {}\n"),
         ]);
         assert!(symbol_exists(&conn, "kept"));
-        assert!(!symbol_exists(&conn, "generated"), "gitignored dir is skipped");
-        assert!(!symbol_exists(&conn, "ignored_by_name"), "gitignored file is skipped");
+        assert!(
+            !symbol_exists(&conn, "generated"),
+            "gitignored dir is skipped"
+        );
+        assert!(
+            !symbol_exists(&conn, "ignored_by_name"),
+            "gitignored file is skipped"
+        );
     }
 
     #[test]
@@ -909,7 +994,10 @@ mod tests {
         let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s.mode, "incremental");
         assert_eq!(s.files_removed, 1);
-        assert!(!symbol_exists(&conn, "generated"), "now-ignored file's symbols are gone");
+        assert!(
+            !symbol_exists(&conn, "generated"),
+            "now-ignored file's symbols are gone"
+        );
         assert!(symbol_exists(&conn, "kept"));
     }
 
@@ -927,15 +1015,23 @@ mod tests {
     fn oversized_files_are_skipped() {
         let mut big = String::from("pub fn huge() {}\n");
         big.push_str(&"// padding padding padding\n".repeat(50_000)); // > 1 MiB
-        let (conn, _dir) =
-            index_repo(&[("svc/a.rs", "pub fn small() {}\n"), ("svc/big.rs", big.as_str())]);
+        let (conn, _dir) = index_repo(&[
+            ("svc/a.rs", "pub fn small() {}\n"),
+            ("svc/big.rs", big.as_str()),
+        ]);
         assert!(symbol_exists(&conn, "small"));
-        assert!(!symbol_exists(&conn, "huge"), "files over the size cap are not indexed");
+        assert!(
+            !symbol_exists(&conn, "huge"),
+            "files over the size cap are not indexed"
+        );
     }
 
     #[test]
     fn incremental_purges_deleted_files() {
-        let dir = build_repo(&[("svc/a.rs", "pub fn f() {}\n"), ("svc/b.rs", "pub fn g() {}\n")]);
+        let dir = build_repo(&[
+            ("svc/a.rs", "pub fn f() {}\n"),
+            ("svc/b.rs", "pub fn g() {}\n"),
+        ]);
         let (mut conn, db_path) = open_db(&dir);
         run(&mut conn, dir.path(), false, &db_path).unwrap();
         assert!(symbol_exists(&conn, "g"));
@@ -943,6 +1039,9 @@ mod tests {
         std::fs::remove_file(dir.path().join("svc/b.rs")).unwrap();
         let s = run(&mut conn, dir.path(), true, &db_path).unwrap();
         assert_eq!(s.files_removed, 1);
-        assert!(!symbol_exists(&conn, "g"), "deleted file's symbols are gone");
+        assert!(
+            !symbol_exists(&conn, "g"),
+            "deleted file's symbols are gone"
+        );
     }
 }

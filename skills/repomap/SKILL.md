@@ -155,6 +155,13 @@ repomap context "invoice tax rounding"
 repomap context "index refresh" --budget 800
 ```
 
+If one result cannot fit, the command reports the minimum required budget
+instead of exceeding the limit.
+
+### `repomap usage [--reset]`
+Shows lifetime query runs, result counts, and the estimated tokens saved by
+using compact pointers. Run `repomap usage --reset` to clear the totals.
+
 ## Typical workflow
 
 1. `repomap context "<task words>"` — one-shot orientation: seeds + neighbors

@@ -6,7 +6,7 @@
 //! fit a declared token budget. Output stays pointers-only, so the whole pack
 //! is safe to drop into a model's context verbatim.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use rusqlite::Connection;
 
 /// How many seed symbols to consider before budget packing.
@@ -23,47 +23,81 @@ struct Seed {
     service: String,
 }
 
-pub fn context(conn: &Connection, query: &str, budget: usize) -> Result<()> {
+pub fn context(conn: &Connection, query: &str, budget: usize) -> Result<usize> {
+    let Some((output, shown)) = build_context(conn, query, budget)? else {
+        eprintln!("no matches for '{query}'");
+        return Ok(0);
+    };
+    println!("{output}");
+    Ok(shown)
+}
+
+fn build_context(conn: &Connection, query: &str, budget: usize) -> Result<Option<(String, usize)>> {
     let seeds = seeds(conn, query)?;
     if seeds.is_empty() {
-        eprintln!("no matches for '{query}'");
-        return Ok(());
+        return Ok(None);
     }
 
-    // Assemble blocks first, then pack: header + services always ship, seed
-    // blocks are added greedily (they arrive relevance-ordered) until the
-    // budget runs out — but at least one seed always ships, otherwise the
-    // pack answers nothing.
-    let header = format!("# context: {query}");
-    let services_block = services_block(conn, &seeds)?;
+    // Blocks arrive in relevance order. Render each candidate prefix in full
+    // so services omitted by the budget do not consume space and the footer
+    // itself is included in the estimate.
     let seed_blocks: Vec<String> = seeds
         .iter()
         .map(|s| seed_block(conn, s))
         .collect::<Result<_>>()?;
 
-    let mut used = est_tokens(&header) + est_tokens(&services_block) + est_tokens("## symbols");
-    let mut shown = 0usize;
-    for block in &seed_blocks {
-        let cost = est_tokens(block);
-        if shown > 0 && used + cost > budget {
-            break;
-        }
-        used += cost;
-        shown += 1;
+    let (mut output, minimum) = render_pack(conn, query, &seeds, &seed_blocks, 1, budget)?;
+    if minimum > budget {
+        bail!("token budget {budget} is too small for one context result (minimum ~{minimum})");
     }
 
-    println!("{header}");
-    println!("{services_block}");
-    println!("## symbols");
-    for block in seed_blocks.iter().take(shown) {
-        println!("{block}");
+    let mut shown = 1;
+    for candidate in 2..=seed_blocks.len() {
+        let (next, used) = render_pack(conn, query, &seeds, &seed_blocks, candidate, budget)?;
+        if used > budget {
+            break;
+        }
+        output = next;
+        shown = candidate;
     }
-    println!(
-        "[~{used} tokens / budget {budget}; {shown}/{} seeds{}]",
-        seed_blocks.len(),
-        if shown < seed_blocks.len() { " — raise --budget for more" } else { "" }
+    Ok(Some((output, shown)))
+}
+
+fn render_pack(
+    conn: &Connection,
+    query: &str,
+    seeds: &[Seed],
+    seed_blocks: &[String],
+    shown: usize,
+    budget: usize,
+) -> Result<(String, usize)> {
+    let services = services_block(conn, &seeds[..shown])?;
+    let body = format!(
+        "# context: {query}\n{services}\n## symbols\n{}",
+        seed_blocks[..shown].join("\n")
     );
-    Ok(())
+    let suffix = if shown < seed_blocks.len() {
+        " — raise --budget for more"
+    } else {
+        ""
+    };
+    let mut used = est_tokens(&body);
+    let mut output = String::new();
+    // The footer contains the estimate itself. A few fixed-point iterations
+    // account for changes in its digit count.
+    for _ in 0..4 {
+        output = format!(
+            "{body}\n[~{used} tokens / budget {budget}; {shown}/{} seeds{suffix}]",
+            seed_blocks.len()
+        );
+        let next = est_tokens(&output);
+        if next == used {
+            break;
+        }
+        used = next;
+    }
+    let final_used = est_tokens(&output);
+    Ok((output, final_used))
 }
 
 /// Top FTS matches for the query, ordered by text relevance then importance —
@@ -162,11 +196,48 @@ fn est_tokens(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn indexed_symbol() -> Connection {
+        let conn = crate::db::open(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO services(name, path, stack) VALUES ('app', '.', 'rust')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO files(path, service, language, loc, git_hash, indexed_at)
+             VALUES ('src/lib.rs', 'app', 'rust', 10, 'h', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(name, kind, file, start_line, end_line, signature,
+                                 service, language)
+             VALUES ('target', 'fn', 'src/lib.rs', 1, 2, 'fn target()', 'app', 'rust')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
     #[test]
     fn token_estimate_scales_with_length_and_lines() {
         assert_eq!(est_tokens(""), 0);
         let one = est_tokens("abcdefgh"); // 8 chars, 1 line -> 3
         assert_eq!(one, 3);
         assert!(est_tokens("abcdefgh\nabcdefgh") > one);
+    }
+
+    #[test]
+    fn context_never_exceeds_the_declared_budget() {
+        let conn = indexed_symbol();
+        let minimum = (0..500)
+            .find(|budget| build_context(&conn, "target", *budget).is_ok())
+            .expect("a reasonable budget must fit one result");
+        assert!(minimum > 0);
+        assert!((0..minimum).all(|budget| build_context(&conn, "target", budget).is_err()));
+
+        let (output, shown) = build_context(&conn, "target", minimum).unwrap().unwrap();
+        assert_eq!(shown, 1);
+        assert!(est_tokens(&output) <= minimum);
     }
 }

@@ -3,10 +3,10 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-/// Bumped whenever the schema changes shape. The index is derived data — a
-/// cache over the working tree — so migration is simply "drop and let the
-/// next (auto-)index rebuild", never an ALTER dance.
-const SCHEMA_VERSION: i32 = 4;
+/// Bumped whenever the derived-index schema changes shape. The index is a
+/// cache over the working tree, so migration drops and rebuilds those tables;
+/// user-owned lifetime usage data is retained.
+const SCHEMA_VERSION: i32 = 5;
 
 pub fn open(path: &str) -> Result<Connection> {
     let conn = Connection::open(path)?;
@@ -46,6 +46,16 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- Lifetime CLI usage is user data, not a derived part of the index. It is
+-- deliberately omitted from the schema-mismatch drop list above.
+CREATE TABLE IF NOT EXISTS usage (
+  command      TEXT PRIMARY KEY,
+  runs         INTEGER NOT NULL,
+  results      INTEGER NOT NULL,
+  tokens_saved INTEGER NOT NULL,
+  last_used    INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -144,7 +154,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idx.db");
         let conn = open(path.to_str().unwrap()).unwrap();
-        let ms: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+        let ms: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
         assert!(ms >= 1000, "busy_timeout must be set, got {ms} ms");
     }
 
@@ -153,7 +165,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("idx.db");
         let conn = open(path.to_str().unwrap()).unwrap();
-        let v: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let v: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(v, SCHEMA_VERSION);
     }
 
@@ -179,7 +193,9 @@ mod tests {
         // Reopening must migrate (drop + recreate), leaving a usable, empty,
         // current-shape database rather than erroring on the missing columns.
         let conn = open(&path_str).unwrap();
-        let n: i64 = conn.query_row("SELECT count(*) FROM files", [], |r| r.get(0)).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 0, "old-shape data is dropped, not carried over");
         conn.execute(
             "INSERT INTO files(path, service, language, loc, git_hash, mtime, size, indexed_at)
@@ -187,5 +203,30 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn schema_rebuild_preserves_lifetime_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idx.db");
+        let path_str = path.to_str().unwrap();
+        let conn = open(path_str).unwrap();
+        conn.execute(
+            "INSERT INTO usage(command, runs, results, tokens_saved, last_used)
+             VALUES ('find', 2, 3, 400, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+        drop(conn);
+
+        let conn = open(path_str).unwrap();
+        let runs: i64 = conn
+            .query_row("SELECT runs FROM usage WHERE command = 'find'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(runs, 2);
     }
 }

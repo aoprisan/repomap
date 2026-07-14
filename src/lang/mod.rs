@@ -72,8 +72,14 @@ impl Language {
     /// language is exercised by tests, so a compile failure here is a build
     /// defect, not a runtime condition — hence the `expect`.
     fn compiled_query(&self) -> &'static Query {
-        fn get(cell: &'static OnceLock<Query>, lang: tree_sitter::Language, src: &str) -> &'static Query {
-            cell.get_or_init(|| Query::new(&lang, src).expect("bundled tree-sitter query must compile"))
+        fn get(
+            cell: &'static OnceLock<Query>,
+            lang: tree_sitter::Language,
+            src: &str,
+        ) -> &'static Query {
+            cell.get_or_init(|| {
+                Query::new(&lang, src).expect("bundled tree-sitter query must compile")
+            })
         }
         macro_rules! cached {
             ($lang:expr, $src:expr) => {{
@@ -110,20 +116,34 @@ mod tests {
     }
 
     fn has_edge(e: &Extracted, kind: &str, dst: &str) -> bool {
-        e.edges
-            .iter()
-            .any(|RawEdge { dst_name, kind: k, .. }| k == kind && dst_name == dst)
+        e.edges.iter().any(
+            |RawEdge {
+                 dst_name, kind: k, ..
+             }| k == kind && dst_name == dst,
+        )
     }
 
     #[test]
     fn from_path_maps_extensions() {
         use std::path::Path;
         assert_eq!(Language::from_path(Path::new("a.rs")), Some(Language::Rust));
-        assert_eq!(Language::from_path(Path::new("a.scala")), Some(Language::Scala));
-        assert_eq!(Language::from_path(Path::new("a.sc")), Some(Language::Scala));
+        assert_eq!(
+            Language::from_path(Path::new("a.scala")),
+            Some(Language::Scala)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("a.sc")),
+            Some(Language::Scala)
+        );
         assert_eq!(Language::from_path(Path::new("a.rb")), Some(Language::Ruby));
-        assert_eq!(Language::from_path(Path::new("a.py")), Some(Language::Python));
-        assert_eq!(Language::from_path(Path::new("a.ts")), Some(Language::Typescript));
+        assert_eq!(
+            Language::from_path(Path::new("a.py")),
+            Some(Language::Python)
+        );
+        assert_eq!(
+            Language::from_path(Path::new("a.ts")),
+            Some(Language::Typescript)
+        );
         assert_eq!(Language::from_path(Path::new("a.tsx")), Some(Language::Tsx));
         assert_eq!(Language::from_path(Path::new("a.txt")), None);
         assert_eq!(Language::from_path(Path::new("noext")), None);
@@ -224,8 +244,14 @@ class Widget(Base):
 
         assert!(has_edge(&e, "call", "draw"), "call edge to draw");
         assert!(has_edge(&e, "extends", "Base"), "base-class edge to Base");
-        assert!(has_edge(&e, "import", "path"), "import os.path last segment");
-        assert!(has_edge(&e, "import", "OrderedDict"), "from-import last segment");
+        assert!(
+            has_edge(&e, "import", "path"),
+            "import os.path last segment"
+        );
+        assert!(
+            has_edge(&e, "import", "OrderedDict"),
+            "from-import last segment"
+        );
     }
 
     #[test]
@@ -258,7 +284,10 @@ const arrow = (y: number) => helper(y);
 
         assert!(has_edge(&e, "call", "draw"), "call edge to draw");
         assert!(has_edge(&e, "extends", "Base"), "extends edge to Base");
-        assert!(has_edge(&e, "extends", "Drawable"), "implements edge to Drawable");
+        assert!(
+            has_edge(&e, "extends", "Drawable"),
+            "implements edge to Drawable"
+        );
         assert!(has_edge(&e, "import", "Base"), "named import Base");
     }
 
@@ -278,6 +307,9 @@ export function after(): number { return render(1); }
         assert_eq!(symbol(&e, "Card").kind, "function");
         assert_eq!(symbol(&e, "List").kind, "function");
         assert_eq!(symbol(&e, "after").kind, "function");
-        assert!(has_edge(&e, "call", "render"), "call edge inside a TSX file");
+        assert!(
+            has_edge(&e, "call", "render"),
+            "call edge inside a TSX file"
+        );
     }
 }

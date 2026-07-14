@@ -138,10 +138,13 @@ fn doc_of(node: Node, bytes: &[u8]) -> Option<String> {
     // The def's own preceding sibling, or — for `export`-wrapped declarations
     // where that sibling is the `export` keyword — the wrapper's. Take whichever
     // is actually a comment.
-    let prev = [node.prev_sibling(), node.parent().and_then(|p| p.prev_sibling())]
-        .into_iter()
-        .flatten()
-        .find(|n| n.kind().contains("comment"))?;
+    let prev = [
+        node.prev_sibling(),
+        node.parent().and_then(|p| p.prev_sibling()),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|n| n.kind().contains("comment"))?;
     let raw = text(prev, bytes);
     let line = raw.lines().next().unwrap_or("");
     let cleaned = line

@@ -59,8 +59,7 @@ fn install_owned(root: &Path, rel_path: &str) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating skill directory {}", parent.display()))?;
     }
-    fs::write(&dest, SKILL_MD)
-        .with_context(|| format!("writing skill to {}", dest.display()))?;
+    fs::write(&dest, SKILL_MD).with_context(|| format!("writing skill to {}", dest.display()))?;
     println!("Installed repomap skill -> {}", dest.display());
     Ok(())
 }
@@ -78,10 +77,13 @@ fn install_shared(root: &Path, rel_path: &str) -> Result<()> {
     let existing = fs::read_to_string(&dest).unwrap_or_default();
     let block = format!("{BEGIN_MARKER}\n{}\n{END_MARKER}", skill_body().trim());
     let updated = merge_block(&existing, &block);
-    fs::write(&dest, &updated)
-        .with_context(|| format!("writing skill to {}", dest.display()))?;
+    fs::write(&dest, &updated).with_context(|| format!("writing skill to {}", dest.display()))?;
 
-    let verb = if existing.trim().is_empty() { "Installed" } else { "Updated" };
+    let verb = if existing.trim().is_empty() {
+        "Installed"
+    } else {
+        "Updated"
+    };
     println!("{verb} repomap skill -> {}", dest.display());
     Ok(())
 }
@@ -106,8 +108,7 @@ fn skill_body() -> &'static str {
 ///
 /// The result always ends with a single trailing newline.
 fn merge_block(existing: &str, block: &str) -> String {
-    if let (Some(start), Some(end_start)) =
-        (existing.find(BEGIN_MARKER), existing.find(END_MARKER))
+    if let (Some(start), Some(end_start)) = (existing.find(BEGIN_MARKER), existing.find(END_MARKER))
     {
         if end_start >= start {
             let end = end_start + END_MARKER.len();
@@ -120,7 +121,11 @@ fn merge_block(existing: &str, block: &str) -> String {
         return format!("{block}\n");
     }
 
-    let sep = if existing.ends_with('\n') { "\n" } else { "\n\n" };
+    let sep = if existing.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
     format!("{existing}{sep}{block}\n")
 }
 
@@ -148,8 +153,14 @@ mod tests {
     fn skill_body_strips_frontmatter() {
         let body = skill_body();
         assert!(!body.starts_with("---"), "frontmatter should be stripped");
-        assert!(!body.contains("description:"), "frontmatter fields should be gone");
-        assert!(body.starts_with("# repomap"), "body should start at the heading");
+        assert!(
+            !body.contains("description:"),
+            "frontmatter fields should be gone"
+        );
+        assert!(
+            body.starts_with("# repomap"),
+            "body should start at the heading"
+        );
     }
 
     #[test]
@@ -177,7 +188,10 @@ mod tests {
 
         assert!(text.contains(BEGIN_MARKER) && text.contains(END_MARKER));
         assert!(text.contains("# repomap"));
-        assert!(!text.contains("description:"), "frontmatter must not leak in");
+        assert!(
+            !text.contains("description:"),
+            "frontmatter must not leak in"
+        );
         assert!(text.ends_with('\n'));
     }
 
@@ -201,7 +215,10 @@ mod tests {
 
         install_skill(root, Agent::Codex).unwrap();
         let after_first = fs::read_to_string(&dest).unwrap();
-        assert!(after_first.contains("Always run tests."), "user content kept");
+        assert!(
+            after_first.contains("Always run tests."),
+            "user content kept"
+        );
         assert!(after_first.contains(BEGIN_MARKER));
         assert_eq!(after_first.matches(BEGIN_MARKER).count(), 1);
 
@@ -230,6 +247,9 @@ mod tests {
         let existing = format!("head\n\n{BEGIN_MARKER}\nold\n{END_MARKER}\n\ntail\n");
         let block = format!("{BEGIN_MARKER}\nnew\n{END_MARKER}");
         let out = merge_block(&existing, &block);
-        assert_eq!(out, format!("head\n\n{BEGIN_MARKER}\nnew\n{END_MARKER}\n\ntail\n"));
+        assert_eq!(
+            out,
+            format!("head\n\n{BEGIN_MARKER}\nnew\n{END_MARKER}\n\ntail\n")
+        );
     }
 }

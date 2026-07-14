@@ -3,7 +3,11 @@ use clap::{Parser, Subcommand};
 use crate::skill::Agent;
 
 #[derive(Parser)]
-#[command(name = "repomap", version, about = "Compact code-navigation index for LLM agents")]
+#[command(
+    name = "repomap",
+    version,
+    about = "Compact code-navigation index for LLM agents"
+)]
 pub struct Cli {
     /// Repo root to index/query.
     #[arg(long, global = true, default_value = ".")]
@@ -110,5 +114,11 @@ pub enum Cmd {
         /// Approximate token budget for the pack.
         #[arg(long, default_value_t = 2000)]
         budget: usize,
+    },
+    /// Report lifetime query usage and estimated tokens saved.
+    Usage {
+        /// Clear all recorded usage statistics.
+        #[arg(long)]
+        reset: bool,
     },
 }

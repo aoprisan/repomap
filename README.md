@@ -75,6 +75,7 @@ repomap rank                   # most important symbols (PageRank)
 repomap impact InvoiceService  # blast radius of changing a symbol
 repomap cochange billing.rs    # files that historically change with it
 repomap context "tax rounding" # token-budgeted orientation pack for a task
+repomap usage                  # lifetime query totals and estimated savings
 ```
 
 No setup step: **query commands refresh the index automatically** before
@@ -306,7 +307,17 @@ src/index.rs:L541  pub fn refresh(conn: &mut Connection, ...) -> Result<()>
 ```
 
 The footer reports actual usage; when seeds are cut for budget it says so
-(`raise --budget for more`).
+(`raise --budget for more`). If even one result cannot fit, the command exits
+with an error and reports the minimum required budget instead of overflowing
+the requested limit.
+
+### `usage [--reset]`
+
+Reports successful query invocations, returned results, and a conservative
+estimate of tokens saved by following compact pointers instead of opening an
+average indexed file for every result. The totals live in the index database
+but survive derived-index schema rebuilds. Use `repomap usage --reset` to clear
+them explicitly.
 
 ## Services
 
@@ -341,11 +352,11 @@ misattributes them to a sibling service.
   capture-name conventions: `@def.<kind>` + `@name` → a symbol;
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.
 - **Store** — symbols and FTS live in SQLite (bundled rusqlite, FTS5). Edges are
-  stored name-keyed in `edge_raw`, then rebuilt into `edges` on each index run
-  by resolving destination names to symbol ids — same service, or cross-service
-  when the source file imports the name; same-file preferred, self-edges
-  excluded (see the note under `callers`). Imported names are recorded per file
-  in `file_imports`, including top-level imports.
+  stored name-keyed in `edge_raw`, then rebuilt into `edges` when indexed files
+  change by resolving destination names to symbol ids — same service, or
+  cross-service when the source file imports the name; same-file preferred,
+  self-edges excluded (see the note under `callers`). Imported names are
+  recorded per file in `file_imports`, including top-level imports.
 - **Rank** — after edges are resolved, PageRank runs over the symbol graph
   (damping 0.85, importance flowing along references) and is stored on each
   symbol; `rank` reads it directly and `find`/`def` use it as a tie-breaker.
@@ -355,8 +366,9 @@ misattributes them to a sibling service.
   untouched, or — when the stat moved — its git blob hash (pure-Rust,
   `git hash-object`-compatible) still matches. Query commands run an
   incremental pass automatically before answering.
-- **Migrations** — the database is a cache: on a schema-version bump, `repomap`
-  drops and rebuilds it on the next (auto-)index instead of migrating in place.
+- **Migrations** — the derived index is a cache: on a schema-version bump,
+  `repomap` drops and rebuilds it on the next (auto-)index instead of migrating
+  in place. Lifetime usage totals are preserved.
 
 ## Adding a language
 
