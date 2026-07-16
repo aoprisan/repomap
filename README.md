@@ -20,7 +20,8 @@ releases](https://github.com/aoprisan/repomap/releases) — download, extract,
 and drop `repomap` on your `PATH`. (Tagging `v*` builds them via
 `.github/workflows/release.yml`.)
 
-Or build from source and copy it onto your `PATH` in one step:
+Or build from source (Rust 1.95 or newer — the declared, CI-checked MSRV) and
+copy it onto your `PATH` in one step:
 
 ```sh
 cargo build --release

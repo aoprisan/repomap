@@ -2,6 +2,9 @@
 name = "repomap"
 version = "0.1.0"
 edition = "2021"
+# libsqlite3-sys 0.38 (via rusqlite 0.40) uses cfg_select!, stabilized in 1.95.
+# Bump deliberately, with the CI msrv job, not as a dependency side effect.
+rust-version = "1.95"
 
 [[bin]]
 name = "repomap"
