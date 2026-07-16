@@ -461,26 +461,10 @@ fn analyze(conn: &Connection, root: &Path, base: &str, depth: usize) -> Result<R
 fn snapshots(language: Language, path: &str, source: &str) -> Result<Vec<Snapshot>> {
     let extracted = language.extract(source)?;
     let lines: Vec<&str> = source.lines().collect();
-    let containers: Vec<Option<String>> = extracted
-        .symbols
-        .iter()
-        .enumerate()
-        .map(|(i, child)| {
-            extracted
-                .symbols
-                .iter()
-                .enumerate()
-                .filter(|(j, parent)| {
-                    *j != i
-                        && parent.start_line <= child.start_line
-                        && parent.end_line >= child.end_line
-                        && (parent.start_line < child.start_line
-                            || parent.end_line > child.end_line)
-                })
-                .min_by_key(|(_, parent)| parent.end_line - parent.start_line)
-                .map(|(_, parent)| parent.name.clone())
-        })
-        .collect();
+    // The same lexical-parent and test-flag derivation as indexing, so the
+    // diff analysis and the live index agree on containers and test status.
+    let parents = lang::symbol_parents(&extracted.symbols);
+    let tests = lang::test_flags(path, &extracted.symbols, &parents);
     Ok(extracted
         .symbols
         .iter()
@@ -493,9 +477,9 @@ fn snapshots(language: Language, path: &str, source: &str) -> Result<Vec<Snapsho
             signature: s.signature.clone(),
             doc: s.doc_first_line.clone(),
             body_hash: own_body_hash(s, &extracted.symbols, &lines),
-            is_test: lang::is_test_symbol(path, s),
+            is_test: tests[i],
             public: is_public(language, s),
-            container: containers[i].clone(),
+            container: parents[i].map(|p| extracted.symbols[p].name.clone()),
         })
         .collect())
 }
@@ -710,7 +694,12 @@ fn affected_symbols(
         } else {
             // Deleted roots have no destination id in the live graph. Reapply
             // the resolver's conservative scoping to raw references: same
-            // service, or an explicit import licensing a cross-service link.
+            // service, or an explicit import (of the name or its qualifier)
+            // licensing a cross-service link. A qualifier matches the deleted
+            // symbol's container, or — for top-level definitions — the module
+            // of the file that held it (`index::refresh` after deleting
+            // `refresh` from index.rs).
+            let module = crate::index::file_module(&c.path);
             let mut refs = conn.prepare(
                 "SELECT DISTINCT er.src_symbol
                  FROM edge_raw er
@@ -718,17 +707,20 @@ fn affected_symbols(
                  WHERE er.dst_name = ?1
                    AND (src.service = ?2 OR EXISTS (
                        SELECT 1 FROM file_imports fi
-                       WHERE fi.file = src.file AND fi.name = er.dst_name
+                       WHERE fi.file = src.file
+                         AND fi.name IN (er.dst_name, er.qualifier)
                    ))
                    AND (
                        (er.qualifier IS NOT NULL AND er.qualifier IS ?3)
                        OR (er.qualifier IS NULL AND (?3 IS NULL OR src.container IS ?3))
+                       OR (?3 IS NULL AND er.qualifier = ?4)
                    )",
             )?;
             direct.extend(
-                refs.query_map(rusqlite::params![name, c.service, c.container], |r| {
-                    r.get::<_, i64>(0)
-                })?
+                refs.query_map(
+                    rusqlite::params![name, c.service, c.container, module],
+                    |r| r.get::<_, i64>(0),
+                )?
                 .filter_map(|r| r.ok()),
             );
         }
@@ -1087,6 +1079,34 @@ mod tests {
             .affected
             .iter()
             .any(|a| a.signature.contains("verifies_behavior") && a.is_test && a.depth == 2));
+    }
+
+    #[test]
+    fn deleted_module_qualified_symbol_keeps_its_callers() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q"]);
+        std::fs::write(root.join("lib.rs"), "pub fn target() {}\n").unwrap();
+        std::fs::write(root.join("consumer.rs"), "fn bridge() { lib::target(); }\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "-qm", "base"]);
+
+        std::fs::write(root.join("lib.rs"), "// target deliberately removed\n").unwrap();
+        let db_path = root.join(".repomap.db");
+        let mut conn = crate::db::open(db_path.to_str().unwrap()).unwrap();
+        crate::index::run(&mut conn, root, false, &db_path).unwrap();
+        let report = analyze(&conn, root, "HEAD", 1).unwrap();
+
+        assert!(
+            report
+                .affected
+                .iter()
+                .any(|a| a.signature.contains("bridge") && a.depth == 1),
+            "a module-qualified caller of a deleted top-level symbol must be recovered"
+        );
     }
 
     #[test]

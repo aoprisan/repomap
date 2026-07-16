@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`repomap` is a Rust CLI that indexes source trees into a SQLite/FTS5 database. The binary entry point is `src/main.rs`; command parsing lives in `src/cli.rs`. Core indexing, storage, service detection, and query behavior are in `src/index.rs`, `src/db.rs`, `src/services.rs`, and `src/query.rs`. Language support is split between Rust bindings in `src/lang/` and Tree-sitter capture queries in `queries/<language>.scm`. Use `fixtures/billing/` for the sample Scala project used by integration-like indexing tests. The embedded agent guide is `skills/repomap/SKILL.md`.
+`repomap` is a Rust CLI that indexes source trees into a SQLite/FTS5 database. The binary entry point is `src/main.rs`; command parsing lives in `src/cli.rs`. Core indexing, storage, service detection, and query behavior are in `src/index.rs`, `src/db.rs`, `src/services.rs`, and `src/query.rs`. Language support is split between Rust bindings in `src/lang/` and Tree-sitter capture queries in `queries/<language>.scm`. Use `fixtures/` for the per-language sample projects exercised by the integration tests in `tests/fixtures.rs`: `billing` (Scala), `inventory` (Rust), `catalog` (Python), `storefront` (TypeScript), and `shipping` (Ruby) — each is declared as a service in `repomap.toml`. The embedded agent guide is `skills/repomap/SKILL.md`.
 
 ## Build, Test, and Development Commands
 

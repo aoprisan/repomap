@@ -35,6 +35,11 @@ pub struct RawEdge {
     /// Last identifier before a member/scoped call (`TaxCalculator` in
     /// `TaxCalculator.withTax`). `None` denotes a bare call.
     pub qualifier: Option<String>,
+    /// True when the qualifier came from a scoped path (Rust `a::b()`) rather
+    /// than a member/attribute access. Scoped paths name modules and types —
+    /// never runtime values — so resolution may match them against file
+    /// modules without import evidence.
+    pub scoped: bool,
     pub kind: String, // call | import | extends
 }
 
@@ -113,6 +118,7 @@ fn test_hint(node: Node, bytes: &[u8]) -> bool {
         let lower = s.to_ascii_lowercase();
         lower.contains("#[test]")
             || lower.contains("::test]")
+            || lower.contains("cfg(test")
             || lower.contains("@test")
             || lower.contains("@pytest")
     };
@@ -158,38 +164,42 @@ fn push_edge(edges: &mut Vec<RawEdge>, node: Node, bytes: &[u8], kind: &str, is_
         raw.to_string()
     };
     if !dst.is_empty() {
-        let qualifier = if kind == "call" {
-            call_qualifier(node, bytes)
+        let (qualifier, scoped) = if kind == "call" {
+            match call_qualifier(node, bytes) {
+                Some((q, scoped)) => (Some(q), scoped),
+                None => (None, false),
+            }
         } else {
-            None
+            (None, false)
         };
         edges.push(RawEdge {
             src_line: node.start_position().row + 1,
             dst_name: dst,
             qualifier,
+            scoped,
             kind: kind.to_string(),
         });
     }
 }
 
 /// Recover the syntactic receiver/module for a captured member or scoped
-/// call. We deliberately keep only its last identifier: it is enough to link
-/// `TaxCalculator.withTax` to a method owned by `TaxCalculator`, while an
-/// instance call such as `store.get` will stay unresolved instead of being
-/// guessed to an unrelated same-named method.
-fn call_qualifier(node: Node, bytes: &[u8]) -> Option<String> {
+/// call, plus whether the syntax was a scoped path. We deliberately keep only
+/// its last identifier: it is enough to link `TaxCalculator.withTax` to a
+/// method owned by `TaxCalculator`, while an instance call such as
+/// `store.get` will stay unresolved instead of being guessed to an unrelated
+/// same-named method.
+fn call_qualifier(node: Node, bytes: &[u8]) -> Option<(String, bool)> {
     let parent = node.parent()?;
     let kind = parent.kind();
-    if !(kind.contains("field")
-        || kind.contains("member")
-        || kind.contains("attribute")
-        || kind.contains("scoped"))
+    // `scope` covers both Rust's scoped_identifier and Ruby's scope_resolution.
+    let scoped = kind.contains("scope");
+    if !(scoped || kind.contains("field") || kind.contains("member") || kind.contains("attribute"))
     {
         return None;
     }
     let prefix = bytes.get(parent.start_byte()..node.start_byte())?;
     let prefix = std::str::from_utf8(prefix).ok()?;
-    last_identifier(prefix)
+    Some((last_identifier(prefix)?, scoped))
 }
 
 fn last_identifier(s: &str) -> Option<String> {

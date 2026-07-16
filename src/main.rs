@@ -224,8 +224,12 @@ fn run() -> Result<ExitCode> {
             record_query(&conn, "outline", results)?;
             Some(results)
         }
-        Cmd::Rank { service, k } => {
-            let results = query::rank(&conn, service.as_deref(), k)?;
+        Cmd::Rank {
+            service,
+            k,
+            include_tests,
+        } => {
+            let results = query::rank(&conn, service.as_deref(), k, include_tests)?;
             record_query(&conn, "rank", results)?;
             Some(results)
         }
@@ -243,8 +247,12 @@ fn run() -> Result<ExitCode> {
             record_query(&conn, "cochange", results)?;
             Some(results)
         }
-        Cmd::Context { query, budget } => {
-            let results = context::context(&conn, &query, budget)?;
+        Cmd::Context {
+            query,
+            budget,
+            include_tests,
+        } => {
+            let results = context::context(&conn, &query, budget, include_tests)?;
             record_query(&conn, "context", results)?;
             Some(results)
         }

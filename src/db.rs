@@ -6,7 +6,7 @@ use rusqlite::Connection;
 /// Bumped whenever the derived-index schema changes shape. The index is a
 /// cache over the working tree, so migration drops and rebuilds those tables;
 /// user-owned lifetime usage data is retained.
-const SCHEMA_VERSION: i32 = 7;
+const SCHEMA_VERSION: i32 = 8;
 
 pub fn open(path: &str) -> Result<Connection> {
     let mut conn = Connection::open(path)?;
@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS files (
   path       TEXT PRIMARY KEY,
   service    TEXT NOT NULL,
   language   TEXT NOT NULL,
+  -- The module this file contributes per language convention: the file stem
+  -- (src/index.rs -> 'index'), or the directory name for directory-module
+  -- files (util/mod.rs, pkg/__init__.py, web/index.ts). Lets edge resolution
+  -- link module-qualified calls ('index::refresh') to the module's file.
+  module     TEXT NOT NULL DEFAULT '',
   loc        INTEGER NOT NULL,
   git_hash   TEXT NOT NULL,
   -- mtime (ns) + size let incremental runs skip a file on a cheap stat,
@@ -112,6 +117,9 @@ CREATE TABLE IF NOT EXISTS edge_raw (
   src_symbol INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
   dst_name   TEXT NOT NULL,
   qualifier  TEXT,
+  -- 1 when the qualifier came from a scoped path (Rust `a::b()`) — module or
+  -- type syntax — rather than a member access on a possibly-runtime value.
+  scoped     INTEGER NOT NULL DEFAULT 0,
   kind       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_edgeraw_src ON edge_raw(src_symbol);

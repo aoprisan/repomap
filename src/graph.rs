@@ -62,8 +62,16 @@ pub fn compute_ranks(conn: &Connection) -> Result<()> {
     }
     let index_of: HashMap<i64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
 
+    // Test symbols stay in the graph as nodes but do not vote: a helper
+    // called from fifty unit tests is not what the production code leans on,
+    // and their references otherwise dominate exactly the well-tested repos
+    // where rank matters most.
     let edges: Vec<(usize, usize)> = {
-        let mut stmt = conn.prepare("SELECT src_symbol, dst_symbol FROM edges")?;
+        let mut stmt = conn.prepare(
+            "SELECT e.src_symbol, e.dst_symbol FROM edges e
+             JOIN symbols s ON s.id = e.src_symbol
+             WHERE s.is_test = 0",
+        )?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
         rows.filter_map(|r| r.ok())
             .filter_map(|(s, d)| Some((*index_of.get(&s)?, *index_of.get(&d)?)))

@@ -103,6 +103,54 @@ impl Language {
     }
 }
 
+/// Innermost strictly-containing definition for each extracted symbol —
+/// the lexical parent used for containers, qualified names, and test-flag
+/// propagation. Shared by indexing and working-tree diff analysis so both
+/// derive the same lexical identity.
+pub fn symbol_parents(symbols: &[RawSymbol]) -> Vec<Option<usize>> {
+    symbols
+        .iter()
+        .enumerate()
+        .map(|(i, child)| {
+            symbols
+                .iter()
+                .enumerate()
+                .filter(|(j, parent)| {
+                    *j != i
+                        && parent.start_line <= child.start_line
+                        && parent.end_line >= child.end_line
+                        && (parent.start_line < child.start_line
+                            || parent.end_line > child.end_line)
+                })
+                .min_by_key(|(_, parent)| parent.end_line - parent.start_line)
+                .map(|(j, _)| j)
+        })
+        .collect()
+}
+
+/// Per-symbol test flags for one file: base detection (annotations, file
+/// conventions, naming) propagated through lexical containment, so a helper
+/// nested inside a `#[cfg(test)] mod tests` — or any other test-flagged
+/// container — counts as test code too.
+pub fn test_flags(path: &str, symbols: &[RawSymbol], parents: &[Option<usize>]) -> Vec<bool> {
+    let base: Vec<bool> = symbols.iter().map(|s| is_test_symbol(path, s)).collect();
+    let mut flags = base.clone();
+    for i in 0..symbols.len() {
+        if flags[i] {
+            continue;
+        }
+        let mut cursor = parents[i];
+        while let Some(parent) = cursor {
+            if base[parent] {
+                flags[i] = true;
+                break;
+            }
+            cursor = parents[parent];
+        }
+    }
+    flags
+}
+
 /// Combine syntax/name hints from extraction with cross-language file naming
 /// conventions. Keeping this in the language layer makes index-time and
 /// working-tree diff analysis agree on what counts as a test.

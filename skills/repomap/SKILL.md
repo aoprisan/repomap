@@ -99,9 +99,11 @@ repomap callees total
 > **Caveat:** calls belong to the innermost callable. Bare calls prefer the
 > same lexical container and otherwise resolve only to a unique same-file or
 > same-service definition. Qualified calls resolve to a method owned by the
-> qualifier; ambiguous or unknown instance receivers are dropped instead of
-> guessed. Imports may license unique cross-service links. The graph is
-> deliberately conservative and can omit dynamic dispatch.
+> qualifier, or — for scoped paths (`index::refresh`) and imported modules
+> (`import pricing; pricing.unit_price(x)`) — to the unique top-level
+> definition in that module's file. Ambiguous or unknown instance receivers
+> are dropped instead of guessed. Imports may license unique cross-service
+> links. The graph is deliberately conservative and can omit dynamic dispatch.
 
 ### `repomap outline <file>`
 All symbols defined in one file, in source order. Accepts the exact
@@ -113,11 +115,12 @@ repomap outline src/query.rs
 repomap outline Invoice.scala
 ```
 
-### `repomap rank [--service S] [-k N]`
+### `repomap rank [--service S] [-k N] [--include-tests]`
 The most structurally important symbols, by PageRank over the reference graph
 (score 100 = top symbol in scope; caller count shown alongside). The fastest
 way to learn what an unfamiliar repo actually revolves around — run it before
-diving in, or per `--service` to orient inside one service.
+diving in, or per `--service` to orient inside one service. Test code neither
+appears nor votes by default; `--include-tests` lists it.
 
 ```sh
 repomap rank -k 10
@@ -148,13 +151,13 @@ repomap cochange src/query.rs
 repomap cochange schema.sql -k 5
 ```
 
-### `repomap context <query> [--budget N]`
+### `repomap context <query> [--budget N] [--include-tests]`
 A one-shot orientation pack for a task: seed symbols matching `<query>`
 (any-word match), each with its top callers (`<-`) and callees (`->`), plus
-the services involved, packed to fit `--budget` tokens (default 2000). Use it
-as the **first command for a new task** instead of stitching together find /
-def / callers / callees; the footer says how much budget was used and whether
-seeds were cut.
+the services involved, packed to fit `--budget` tokens (default 2000). Test
+symbols are excluded unless `--include-tests`. Use it as the **first command
+for a new task** instead of stitching together find / def / callers /
+callees; the footer says how much budget was used and whether seeds were cut.
 
 ```sh
 repomap context "invoice tax rounding"

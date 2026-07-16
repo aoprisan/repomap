@@ -483,14 +483,25 @@ fn write_file(
     now: i64,
 ) -> Result<()> {
     tx.execute(
-        "INSERT INTO files(path, service, language, loc, git_hash, mtime, size, indexed_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        rusqlite::params![rel, service.name, lang.name(), loc, hash, mtime, size, now],
+        "INSERT INTO files(path, service, language, module, loc, git_hash, mtime, size, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            rel,
+            service.name,
+            lang.name(),
+            file_module(rel),
+            loc,
+            hash,
+            mtime,
+            size,
+            now
+        ],
     )?;
 
     // Establish lexical identities before insertion. These survive database
     // row-id churn and let edge resolution prefer the source's actual owner.
-    let parents = symbol_parents(&extracted.symbols);
+    let parents = crate::lang::symbol_parents(&extracted.symbols);
+    let tests = crate::lang::test_flags(rel, &extracted.symbols, &parents);
     let qualified: Vec<String> = (0..extracted.symbols.len())
         .map(|i| qualified_name(&extracted.symbols, &parents, i))
         .collect();
@@ -516,7 +527,7 @@ fn write_file(
                 qualified[i],
                 service.name,
                 lang.name(),
-                crate::lang::is_test_symbol(rel, s),
+                tests[i],
             ])?;
             spans.push(IndexedSpan {
                 id: tx.last_insert_rowid(),
@@ -532,8 +543,8 @@ fn write_file(
     // they license cross-service resolution for that name from this file.
     {
         let mut stmt = tx.prepare(
-            "INSERT INTO edge_raw(src_symbol, dst_name, qualifier, kind)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO edge_raw(src_symbol, dst_name, qualifier, scoped, kind)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )?;
         let mut imp =
             tx.prepare("INSERT OR IGNORE INTO file_imports(file, name) VALUES (?1, ?2)")?;
@@ -542,7 +553,13 @@ fn write_file(
                 imp.execute(rusqlite::params![rel, e.dst_name])?;
             }
             if let Some(src_id) = edge_owner(&spans, e.src_line, &e.kind) {
-                stmt.execute(rusqlite::params![src_id, e.dst_name, e.qualifier, e.kind])?;
+                stmt.execute(rusqlite::params![
+                    src_id,
+                    e.dst_name,
+                    e.qualifier,
+                    e.scoped,
+                    e.kind
+                ])?;
             }
         }
     }
@@ -556,25 +573,24 @@ struct IndexedSpan {
     kind: String,
 }
 
-fn symbol_parents(symbols: &[crate::lang::RawSymbol]) -> Vec<Option<usize>> {
-    symbols
-        .iter()
-        .enumerate()
-        .map(|(i, child)| {
-            symbols
-                .iter()
-                .enumerate()
-                .filter(|(j, parent)| {
-                    *j != i
-                        && parent.start_line <= child.start_line
-                        && parent.end_line >= child.end_line
-                        && (parent.start_line < child.start_line
-                            || parent.end_line > child.end_line)
-                })
-                .min_by_key(|(_, parent)| parent.end_line - parent.start_line)
-                .map(|(j, _)| j)
-        })
-        .collect()
+/// The module a file contributes, per language convention: normally the file
+/// stem (`src/index.rs` -> `index`), with directory-module files named by
+/// their directory (`util/mod.rs` -> `util`, `pkg/__init__.py` -> `pkg`,
+/// `web/index.ts` -> `web`). Used to resolve module-qualified calls.
+pub(crate) fn file_module(rel: &str) -> String {
+    let mut parts = rel.rsplit('/');
+    let file = parts.next().unwrap_or(rel);
+    let (stem, ext) = file.rsplit_once('.').unwrap_or((file, ""));
+    let dir_module = matches!(
+        (stem, ext),
+        ("mod", "rs") | ("__init__", "py") | ("index", "ts") | ("index", "tsx")
+    );
+    if dir_module {
+        if let Some(dir) = parts.next() {
+            return dir.to_string();
+        }
+    }
+    stem.to_string()
 }
 
 fn qualified_name(
@@ -642,9 +658,13 @@ fn enclosing(spans: &[(i64, usize, usize)], line: usize) -> Option<i64> {
 /// * A bare call first resolves to a sibling in the same lexical container.
 ///   Otherwise it resolves only when the same-file or same-service candidate
 ///   is unique; ambiguous names are dropped instead of guessed.
-/// * A qualified call resolves only to a definition owned by that qualifier
-///   (`TaxCalculator.withTax` -> `TaxCalculator::withTax`). Instance receivers
-///   without a matching indexed container stay unresolved.
+/// * A qualified call resolves first to a definition owned by that qualifier
+///   (`TaxCalculator.withTax` -> `TaxCalculator::withTax`). Failing that, the
+///   qualifier may name a *file module* (`index::refresh` -> the top-level
+///   `refresh` in `index.rs`) — but only when the syntax was a scoped path
+///   (which names modules/types, never runtime values) or the source file
+///   imports the qualifier, and only when the target is unique. Instance
+///   receivers without either form of evidence stay unresolved.
 /// * **Self-edges are excluded** so a symbol is never its own caller (e.g. a
 ///   recursive call, or a method whose body references its own name).
 ///
@@ -683,6 +703,35 @@ fn resolve_edges(tx: &rusqlite::Transaction) -> Result<()> {
                                            AND s.container = er.qualifier
                                            AND s.id <> er.src_symbol
                                          ORDER BY s.id LIMIT 1)
+                             END),
+                            -- The qualifier names a sibling file's module in
+                            -- the same service; the callee must be top-level
+                            -- there. Licensed by a scoped path (module/type
+                            -- syntax) or an import of the module name, and
+                            -- only when unambiguous.
+                            (CASE WHEN er.scoped = 1
+                                       OR EXISTS (SELECT 1 FROM file_imports fi
+                                                   WHERE fi.file = src.file
+                                                     AND fi.name = er.qualifier)
+                                  THEN (SELECT CASE WHEN count(*) = 1 THEN min(s.id) END
+                                          FROM symbols s JOIN files f ON f.path = s.file
+                                         WHERE s.name = er.dst_name
+                                           AND s.container IS NULL
+                                           AND f.module = er.qualifier
+                                           AND s.service = src.service
+                                           AND s.id <> er.src_symbol)
+                             END),
+                            -- An imported module may cross services when the
+                            -- target is unique.
+                            (CASE WHEN EXISTS (SELECT 1 FROM file_imports fi
+                                                WHERE fi.file = src.file
+                                                  AND fi.name = er.qualifier)
+                                  THEN (SELECT CASE WHEN count(*) = 1 THEN min(s.id) END
+                                          FROM symbols s JOIN files f ON f.path = s.file
+                                         WHERE s.name = er.dst_name
+                                           AND s.container IS NULL
+                                           AND f.module = er.qualifier
+                                           AND s.id <> er.src_symbol)
                              END)
                         )
                     ELSE COALESCE(
@@ -1081,6 +1130,113 @@ mod tests {
             ("svcb/b.rs", "pub fn helper() {}\npub fn other() {}\n"),
         ]);
         assert!(!edge_exists(&conn, "caller", "helper"));
+    }
+
+    #[test]
+    fn file_module_uses_stems_and_directory_module_conventions() {
+        assert_eq!(file_module("src/index.rs"), "index");
+        assert_eq!(file_module("src/util/mod.rs"), "util");
+        assert_eq!(file_module("pkg/__init__.py"), "pkg");
+        assert_eq!(file_module("web/index.ts"), "web");
+        assert_eq!(file_module("index.ts"), "index"); // no directory to name
+        assert_eq!(file_module("noext"), "noext");
+    }
+
+    #[test]
+    fn scoped_module_call_resolves_to_the_files_top_level_definition() {
+        // `util::helper()` — the qualifier names a file module, not an
+        // indexed container. Scoped syntax alone licenses the edge.
+        let (conn, _dir) = index_repo(&[
+            (
+                "svc/main.rs",
+                "mod util;\npub fn caller() { util::helper(); }\n",
+            ),
+            ("svc/util.rs", "pub fn helper() {}\n"),
+        ]);
+        assert_eq!(dst_file_of(&conn, "caller").as_deref(), Some("svc/util.rs"));
+    }
+
+    #[test]
+    fn ambiguous_module_qualified_calls_are_dropped() {
+        let (conn, _dir) = index_repo(&[
+            ("svc/main.rs", "pub fn caller() { util::helper(); }\n"),
+            ("svc/a/util.rs", "pub fn helper() {}\n"),
+            ("svc/b/util.rs", "pub fn helper() {}\n"),
+        ]);
+        assert!(
+            !edge_exists(&conn, "caller", "helper"),
+            "two same-named modules in one service must not be guessed between"
+        );
+    }
+
+    #[test]
+    fn scoped_module_calls_do_not_cross_services_without_an_import() {
+        let (conn, _dir) = index_repo(&[
+            ("svca/main.rs", "pub fn caller() { util::helper(); }\n"),
+            ("svcb/util.rs", "pub fn helper() {}\n"),
+        ]);
+        assert!(!edge_exists(&conn, "caller", "helper"));
+    }
+
+    #[test]
+    fn unimported_member_receivers_do_not_module_match() {
+        // `store.get(1)` where `store` is (probably) a runtime value: without
+        // an import of `store`, the same-named module file must not attract
+        // the edge.
+        let (conn, _dir) = index_repo(&[
+            ("svc/app.py", "def caller():\n    return store.get(1)\n"),
+            ("svc/store.py", "def get(x):\n    return x\n"),
+        ]);
+        assert!(!edge_exists(&conn, "caller", "get"));
+    }
+
+    #[test]
+    fn imported_module_member_calls_resolve_to_the_module_file() {
+        let (conn, _dir) = index_repo(&[
+            (
+                "svc/app.py",
+                "import store\n\ndef caller():\n    return store.get(1)\n",
+            ),
+            ("svc/store.py", "def get(x):\n    return x\n"),
+        ]);
+        assert_eq!(
+            dst_file_of(&conn, "caller").as_deref(),
+            Some("svc/store.py")
+        );
+    }
+
+    #[test]
+    fn imported_module_calls_may_cross_services() {
+        let (conn, _dir) = index_repo(&[
+            (
+                "svca/app.py",
+                "import store\n\ndef caller():\n    return store.get(1)\n",
+            ),
+            ("svcb/store.py", "def get(x):\n    return x\n"),
+        ]);
+        assert!(edge_exists(&conn, "caller", "get"));
+    }
+
+    #[test]
+    fn helpers_inside_a_cfg_test_module_are_flagged_as_tests() {
+        let (conn, _dir) = index_repo(&[(
+            "svc/a.rs",
+            "pub fn prod() {}\n\n#[cfg(test)]\nmod tests {\n    fn helper() {}\n\n    #[test]\n    fn checks() { helper(); }\n}\n",
+        )]);
+        let is_test = |name: &str| -> i64 {
+            conn.query_row("SELECT is_test FROM symbols WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(is_test("prod"), 0);
+        assert_eq!(is_test("tests"), 1, "#[cfg(test)] mod is test code");
+        assert_eq!(
+            is_test("helper"),
+            1,
+            "helpers nested in a test module are test code"
+        );
+        assert_eq!(is_test("checks"), 1);
     }
 
     #[test]

@@ -7,6 +7,38 @@ entrypoints = ["src/main/scala/billing/InvoiceService.scala"]
 deps = []
 
 [[service]]
+name = "inventory"
+path = "fixtures/inventory"
+stack = "rust"
+purpose = "Rust parser fixture (module-qualified calls, cfg(test) module)"
+entrypoints = ["src/main.rs"]
+deps = []
+
+[[service]]
+name = "catalog"
+path = "fixtures/catalog"
+stack = "python"
+purpose = "Python parser fixture (imported-module calls, tests/ dir)"
+entrypoints = ["orders.py"]
+deps = []
+
+[[service]]
+name = "storefront"
+path = "fixtures/storefront"
+stack = "typescript"
+purpose = "TypeScript parser fixture (named imports, .test.ts file)"
+entrypoints = ["src/cart.ts"]
+deps = []
+
+[[service]]
+name = "shipping"
+path = "fixtures/shipping"
+stack = "ruby"
+purpose = "Ruby parser fixture (class-owned calls, spec/ dir)"
+entrypoints = ["lib/quote.rb"]
+deps = []
+
+[[service]]
 name = "repomap"
 path = "src"
 stack = "rust"
