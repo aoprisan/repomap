@@ -20,7 +20,8 @@ releases](https://github.com/aoprisan/repomap/releases) — download, extract,
 and drop `repomap` on your `PATH`. (Tagging `v*` builds them via
 `.github/workflows/release.yml`.)
 
-Or build from source and copy it onto your `PATH` in one step:
+Or build from source (Rust 1.95 or newer — the declared, CI-checked MSRV) and
+copy it onto your `PATH` in one step:
 
 ```sh
 cargo build --release
@@ -210,8 +211,13 @@ repeated names.
 > variables. Bare calls first resolve to a sibling in the same lexical
 > container, then only to a unique same-file or same-service definition.
 > Qualified calls such as `TaxCalculator.withTax` resolve to a method owned by
-> that qualifier. Ambiguous and unknown instance-receiver calls are dropped
-> instead of guessed; explicit imports can license unique cross-service edges.
+> that qualifier; when no indexed container matches, the qualifier may name a
+> **file module** — `index::refresh` links to the top-level `refresh` in
+> `index.rs`, and `pricing.unit_price(x)` links into `pricing.py` when the
+> source file does `import pricing`. Module matches require a scoped path or
+> an import as evidence, plus a unique target. Ambiguous and unknown
+> instance-receiver calls are dropped instead of guessed; explicit imports can
+> license unique cross-service edges.
 
 ### `callees <symbol> [--service S] [--file F] [--kind K]`
 
@@ -236,7 +242,7 @@ fixtures/billing/src/main/scala/billing/Invoice.scala:L14  object InvoiceService
 fixtures/billing/src/main/scala/billing/Invoice.scala:L18  def get(id: String): Option[Invoice] = store.get(id)  [InvoiceService]
 ```
 
-### `rank [--service S] [-k N]`
+### `rank [--service S] [-k N] [--include-tests]`
 
 The structurally most important symbols, by **PageRank over the reference
 graph** — a symbol used by important symbols is important, which raw caller
@@ -244,14 +250,19 @@ counts can't express. Scores are normalized so the top symbol in scope is 100.
 Every index run recomputes ranks, and `find`/`def` use them to break ties, so
 the definition a repo actually leans on surfaces before same-named helpers.
 
+Test code is excluded twice over: test symbols are not listed, and their
+references don't vote in the PageRank — a helper called from fifty unit tests
+says nothing about what production code leans on. `--include-tests` lists
+test symbols again.
+
 Run it (optionally per `--service`) to learn what a codebase revolves around
 before reading anything:
 
 ```
 $ repomap rank -k 3
-src/services.rs:L76  pub fn new(mut services: Vec<Service>) -> Self  [Resolver]  (score 100, 41 callers)
-src/lang/mod.rs:L75  fn get(cell: &'static OnceLock<Query>, ...) -> &'static Query  [compiled_query]  (score 69, 69 callers)
-src/query.rs:L350  pub fn map(conn: &Connection) -> Result<()>  [-]  (score 32, 31 callers)
+src/output.rs:L26  pub fn is_jsonl() -> bool  [-]  (score 100, 9 callers)
+src/output.rs:L41  pub fn emit(event: &str, data: Value, text: impl AsRef<str>)  [-]  (score 55, 28 callers)
+src/output.rs:L49  pub fn diagnostic(level: &str, code: &str, message: impl AsRef<str>)  [-]  (score 48, 4 callers)
 ```
 
 (Note the second line: more callers, lower score — *who* references you
@@ -311,15 +322,17 @@ README.md  4/7 commits (57%)
 Requires `git` on PATH and commit history; without either it explains itself
 instead of answering.
 
-### `context <query> [--budget N]`
+### `context <query> [--budget N] [--include-tests]`
 
 A one-shot, token-budgeted **orientation pack** for a task: seed symbols
 matching `<query>` (any-word match, fullest matches first), each with its most
 important callers (`<-`) and callees (`->`), plus the services involved —
 packed greedily to fit `--budget` tokens (default 2000, estimated at ~4
-chars/token). One command replaces the find → def → callers → callees dance
-when starting work, and the output is still pointers-only, sized for pasting
-straight into an agent's context:
+chars/token). Test symbols are excluded from seeds and neighbors unless
+`--include-tests`, so the pack orients on production code. One command
+replaces the find → def → callers → callees dance when starting work, and the
+output is still pointers-only, sized for pasting straight into an agent's
+context:
 
 ```
 $ repomap context "index refresh" --budget 300
@@ -411,17 +424,21 @@ misattributes them to a sibling service.
   capture-name conventions: `@def.<kind>` + `@name` → a symbol;
   `@call.name` / `@extends.name` / `@import.*` → best-effort edges.
 - **Store** — symbols and FTS live in SQLite (bundled rusqlite, FTS5). Edges are
-  stored with their bare/qualified reference in `edge_raw`, then rebuilt into
-  `edges` when indexed files change. Symbols carry lexical container and
-  qualified-name identity. Resolution prefers the same lexical container and
-  otherwise accepts only unique scoped candidates; self-edges and ambiguous
-  guesses are excluded. Imported names are recorded per file in
-  `file_imports`, including top-level imports.
+  stored with their bare/qualified reference in `edge_raw` (plus whether the
+  qualifier came from a scoped path), then rebuilt into `edges` when indexed
+  files change. Symbols carry lexical container and qualified-name identity;
+  files record the module they contribute (`index.rs` → `index`,
+  `util/mod.rs` → `util`, `pkg/__init__.py` → `pkg`). Resolution prefers the
+  same lexical container, then unique scoped candidates, then — for scoped or
+  imported qualifiers — the unique top-level definition in the matching module
+  file; self-edges and ambiguous guesses are excluded. Imported names are
+  recorded per file in `file_imports`, including top-level imports.
 - **Rank** — after edges are resolved, PageRank runs over the symbol graph
   (damping 0.85, importance flowing along references) and is stored on each
-  symbol; `rank` reads it directly and `find`/`def` use it as a tie-breaker.
-  `impact` BFS-walks the same graph in reverse; `cochange` is independent of
-  the graph — it mines `git log` at query time.
+  symbol; references from test symbols don't vote, so rank reflects what
+  production code leans on. `rank` reads it directly and `find`/`def` use it
+  as a tie-breaker. `impact` BFS-walks the same graph in reverse; `cochange`
+  is independent of the graph — it mines `git log` at query time.
 - **Change intelligence** — `changes` extracts symbols from the Git base and
   working tree, fingerprints definitions with nested bodies excluded, joins
   the semantic diff to resolved and unresolved references, and walks outward

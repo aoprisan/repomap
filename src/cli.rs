@@ -123,6 +123,9 @@ pub enum Cmd {
         service: Option<String>,
         #[arg(short = 'k', default_value_t = 20)]
         k: usize,
+        /// Include test symbols (excluded by default).
+        #[arg(long)]
+        include_tests: bool,
     },
     /// Blast radius of changing <symbol>: transitive callers up to --depth
     /// hops, nearest and most important first.
@@ -152,6 +155,9 @@ pub enum Cmd {
         /// Approximate token budget for the pack.
         #[arg(long, default_value_t = 2000)]
         budget: usize,
+        /// Include test symbols (excluded by default).
+        #[arg(long)]
+        include_tests: bool,
     },
     /// Analyze the working-tree diff as symbols: classify API/body changes,
     /// trace affected callers (including callers of deleted definitions), and

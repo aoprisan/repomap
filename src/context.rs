@@ -24,8 +24,13 @@ struct Seed {
     service: String,
 }
 
-pub fn context(conn: &Connection, query: &str, budget: usize) -> Result<usize> {
-    let Some((output, shown)) = build_context(conn, query, budget)? else {
+pub fn context(
+    conn: &Connection,
+    query: &str,
+    budget: usize,
+    include_tests: bool,
+) -> Result<usize> {
+    let Some((output, shown)) = build_context(conn, query, budget, include_tests)? else {
         crate::output::no_match(format!("no matches for '{query}'"));
         return Ok(0);
     };
@@ -42,8 +47,13 @@ pub fn context(conn: &Connection, query: &str, budget: usize) -> Result<usize> {
     Ok(shown)
 }
 
-fn build_context(conn: &Connection, query: &str, budget: usize) -> Result<Option<(String, usize)>> {
-    let seeds = seeds(conn, query)?;
+fn build_context(
+    conn: &Connection,
+    query: &str,
+    budget: usize,
+    include_tests: bool,
+) -> Result<Option<(String, usize)>> {
+    let seeds = seeds(conn, query, include_tests)?;
     if seeds.is_empty() {
         return Ok(None);
     }
@@ -53,7 +63,7 @@ fn build_context(conn: &Connection, query: &str, budget: usize) -> Result<Option
     // itself is included in the estimate.
     let seed_blocks: Vec<String> = seeds
         .iter()
-        .map(|s| seed_block(conn, s))
+        .map(|s| seed_block(conn, s, include_tests))
         .collect::<Result<_>>()?;
 
     let (mut output, minimum) = render_pack(conn, query, &seeds, &seed_blocks, 1, budget)?;
@@ -111,18 +121,24 @@ fn render_pack(
 }
 
 /// Top FTS matches for the query, ordered by text relevance then importance —
-/// the same ordering `find` uses, so the pack starts where `find` would.
-fn seeds(conn: &Connection, query: &str) -> Result<Vec<Seed>> {
+/// the same ordering `find` uses, so the pack starts where `find` would. An
+/// orientation pack is about production code, so test symbols are excluded
+/// unless explicitly requested.
+fn seeds(conn: &Connection, query: &str, include_tests: bool) -> Result<Vec<Seed>> {
     let mut stmt = conn.prepare(
         "SELECT s.id, s.file, s.start_line, s.signature, s.name, s.service
          FROM symbols_fts f
          JOIN symbols s ON s.id = f.rowid
-         WHERE symbols_fts MATCH ?1
+         WHERE symbols_fts MATCH ?1 AND (s.is_test = 0 OR ?3)
          ORDER BY bm25(symbols_fts), s.rank DESC
          LIMIT ?2",
     )?;
     let rows = stmt.query_map(
-        rusqlite::params![crate::query::fts_query_any(query), MAX_SEEDS as i64],
+        rusqlite::params![
+            crate::query::fts_query_any(query),
+            MAX_SEEDS as i64,
+            include_tests
+        ],
         |r| {
             let file: String = r.get(1)?;
             let line: i64 = r.get(2)?;
@@ -162,33 +178,37 @@ fn services_block(conn: &Connection, seeds: &[Seed]) -> Result<String> {
 }
 
 /// One seed's block: its pointer line plus its most important callers (`<-`)
-/// and callees (`->`), one line each.
-fn seed_block(conn: &Connection, seed: &Seed) -> Result<String> {
+/// and callees (`->`), one line each. Test neighbors are excluded with the
+/// same default as seeds so they can't crowd out production callers.
+fn seed_block(conn: &Connection, seed: &Seed, include_tests: bool) -> Result<String> {
     let mut out = seed.line.clone();
     for (arrow, sql) in [
         (
             "<-",
             "SELECT n.file, n.start_line, n.name, e.kind FROM edges e
              JOIN symbols n ON n.id = e.src_symbol
-             WHERE e.dst_symbol = ?1
+             WHERE e.dst_symbol = ?1 AND (n.is_test = 0 OR ?3)
              GROUP BY n.id ORDER BY n.rank DESC LIMIT ?2",
         ),
         (
             "->",
             "SELECT n.file, n.start_line, n.name, e.kind FROM edges e
              JOIN symbols n ON n.id = e.dst_symbol
-             WHERE e.src_symbol = ?1
+             WHERE e.src_symbol = ?1 AND (n.is_test = 0 OR ?3)
              GROUP BY n.id ORDER BY n.rank DESC LIMIT ?2",
         ),
     ] {
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params![seed.id, MAX_NEIGHBORS as i64], |r| {
-            let file: String = r.get(0)?;
-            let line: i64 = r.get(1)?;
-            let name: String = r.get(2)?;
-            let kind: String = r.get(3)?;
-            Ok(format!("  {arrow} {file}:L{line}  {name}  ({kind})"))
-        })?;
+        let rows = stmt.query_map(
+            rusqlite::params![seed.id, MAX_NEIGHBORS as i64, include_tests],
+            |r| {
+                let file: String = r.get(0)?;
+                let line: i64 = r.get(1)?;
+                let name: String = r.get(2)?;
+                let kind: String = r.get(3)?;
+                Ok(format!("  {arrow} {file}:L{line}  {name}  ({kind})"))
+            },
+        )?;
         for line in rows.filter_map(|r| r.ok()) {
             out.push('\n');
             out.push_str(&line);
@@ -241,13 +261,41 @@ mod tests {
     fn context_never_exceeds_the_declared_budget() {
         let conn = indexed_symbol();
         let minimum = (0..500)
-            .find(|budget| build_context(&conn, "target", *budget).is_ok())
+            .find(|budget| build_context(&conn, "target", *budget, false).is_ok())
             .expect("a reasonable budget must fit one result");
         assert!(minimum > 0);
-        assert!((0..minimum).all(|budget| build_context(&conn, "target", budget).is_err()));
+        assert!((0..minimum).all(|budget| build_context(&conn, "target", budget, false).is_err()));
 
-        let (output, shown) = build_context(&conn, "target", minimum).unwrap().unwrap();
+        let (output, shown) = build_context(&conn, "target", minimum, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(shown, 1);
         assert!(est_tokens(&output) <= minimum);
+    }
+
+    #[test]
+    fn context_excludes_test_symbols_unless_asked() {
+        let conn = indexed_symbol();
+        conn.execute(
+            "INSERT INTO symbols(name, kind, file, start_line, end_line, signature,
+                                 service, language, is_test)
+             VALUES ('target_test_helper', 'fn', 'src/lib.rs', 5, 6,
+                     'fn target_test_helper()', 'app', 'rust', 1)",
+            [],
+        )
+        .unwrap();
+
+        let (output, _) = build_context(&conn, "target", 2000, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !output.contains("target_test_helper"),
+            "test symbols must not seed a default context pack:\n{output}"
+        );
+        let (output, _) = build_context(&conn, "target", 2000, true).unwrap().unwrap();
+        assert!(
+            output.contains("target_test_helper"),
+            "--include-tests must bring test symbols back:\n{output}"
+        );
     }
 }

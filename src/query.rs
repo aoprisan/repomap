@@ -309,17 +309,31 @@ pub fn callees(conn: &Connection, selector: &SymbolSelector) -> Result<usize> {
 /// Structurally most important symbols, by PageRank over the reference graph.
 /// The score is normalized so the top symbol in scope is 100 — comparable
 /// within one invocation, not across repos. Orientation: run this (optionally
-/// per service) to learn what a codebase actually revolves around.
-pub fn rank(conn: &Connection, service: Option<&str>, k: usize) -> Result<usize> {
+/// per service) to learn what a codebase actually revolves around. Test code
+/// is excluded unless `include_tests` — a repo's test helpers are heavily
+/// referenced but say nothing about what production code leans on.
+pub fn rank(
+    conn: &Connection,
+    service: Option<&str>,
+    k: usize,
+    include_tests: bool,
+) -> Result<usize> {
     let pointer = pointer_columns("s");
     let mut sql = format!(
         "SELECT {pointer}, s.rank, {INDEG_SQL}
          FROM symbols s"
     );
+    let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if !include_tests {
+        clauses.push("s.is_test = 0".into());
+    }
     if let Some(v) = service {
         params.push(Box::new(v.to_string()));
-        sql.push_str(" WHERE s.service = ?1");
+        clauses.push(format!("s.service = ?{}", params.len()));
+    }
+    if !clauses.is_empty() {
+        sql.push_str(&format!(" WHERE {}", clauses.join(" AND ")));
     }
     sql.push_str(&format!(
         " ORDER BY s.rank DESC, s.file, s.start_line LIMIT {k}"
@@ -768,6 +782,27 @@ mod tests {
             )
             .unwrap();
         assert_eq!(qualified, "B::get");
+    }
+
+    #[test]
+    fn rank_excludes_test_symbols_by_default() {
+        let conn = crate::db::open(":memory:").unwrap();
+        conn.execute(
+            "INSERT INTO files(path, service, language, loc, git_hash, indexed_at)
+             VALUES ('src/a.rs', 'app', 'rust', 1, 'h', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(name, kind, file, start_line, end_line,
+                                 service, language, is_test, rank)
+             VALUES ('prod', 'fn', 'src/a.rs', 1, 1, 'app', 'rust', 0, 0.6),
+                    ('test_helper', 'fn', 'src/a.rs', 2, 2, 'app', 'rust', 1, 0.4)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(rank(&conn, None, 10, false).unwrap(), 1);
+        assert_eq!(rank(&conn, None, 10, true).unwrap(), 2);
     }
 
     #[test]
